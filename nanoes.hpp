@@ -447,7 +447,7 @@ namespace nanoes {
 		}
 
 		struct sscope : scope {
-			sscope(slot* islots, int icount, scopeinfo *in_info = nullptr) : scope(islots, in_info ? icount : 0, in_info) {
+			sscope(slot* islots, int icount, scopeinfo *in_info = nullptr) : scope(islots, icount, in_info) {
 				for (int i = 0;i < count;i++)
 					::new (slots + i) slot();
 			}
@@ -824,14 +824,14 @@ namespace nanoes {
 		((valuebase*)data)->~valuebase();
 	}
 	runtime::slot::slot() {
-		set<bool>(false);
+		new(data) value<bool>(false);
 	}
 	void runtime::nfun::invoke(slot& out, int argc, slot *args)
 	{
 		// create local scope if the functions scope is local.
 		bool is_local = info->local;
 		slot* localdata = is_local ? (slot*)alloca(sizeof(slot)*info->names.size()) : nullptr;
-		sscope local(localdata, info->names.size(), info.get());
+		sscope local(localdata, localdata?info->names.size():0, info.get());
 		scope * fnscope = &local;
 		if (!is_local) {
 			abort(); // TODO!
@@ -845,6 +845,7 @@ namespace nanoes {
 	}
 	template<class T, class ... ARG>
 	inline void runtime::slot::set(ARG&&... args) {
+		((valuebase*)data)->~valuebase();
 		new(data) value<T>(std::forward<ARG>(args)...);
 	}
 };

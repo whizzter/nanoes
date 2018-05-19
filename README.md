@@ -13,16 +13,16 @@ MIT
 Done:
 + lexer
 + parser / script-gen
-+ if statements
++ GC
 + some basic arithmetic operators
 + function (s)
++ if statements
++ while loops
 
 TODO:
-+ GC
 + objects
 + arrays
 + full operator set
-+ while loops
 + for loops
 + var variables
 

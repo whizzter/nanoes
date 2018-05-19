@@ -67,10 +67,32 @@ namespace nanoes {
 			toks.emplace_back(out, v);
 			return out;
 		}
-		const int ADD = atok("+"), T_SUB = atok("-"), MUL = atok("*"), T_DIV = atok("/"), T_MOD = atok("%");
-		const int LT = atok("<"), LEQ = atok("<="), GEQ = atok(">="), GT = atok(">"), EQ = atok("=="), NEQ = atok("!=");
-		const int SEMICOLON = atok(";"), COMMA = atok(","), LPAR = atok("("), RPAR = atok(")"), LBRA = atok("{"), RBRA = atok("}");
-		const int T_IF = atok("if"), T_ELSE = atok("else"), T_FUNCTION = atok("function"), T_RETURN = atok("return"), T_THIS = atok("this");
+
+		// 1 : seq
+		const int SEMICOLON = atok(";"), COMMA = atok(","), LBRA = atok("{"), RBRA = atok("}");
+		// 2 : yield
+		// 3 : assign
+		// 4 : conditional
+		// 5 : logor
+		// 6 : logand
+		// 7 : bitor
+		// 8 : bitxor
+		// 9 : bitand
+		// 10 : equality
+		const int EQ = atok("=="), NEQ = atok("!=");
+		// 11 : relative comparison
+		const int LT = atok("<"), LEQ = atok("<="), GEQ = atok(">="), GT = atok(">");
+		// 13 : additive
+		const int ADD = atok("+"), T_SUB = atok("-");
+		// 14 : multiplicative
+		const int MUL = atok("*"), T_DIV = atok("/"), T_MOD = atok("%");
+		// 15 : exponentiation
+		// 16 : prefix ops..
+		// 17 : postdec
+		// 18 : new (no-arg)
+		// 19 : fncall/access
+		const int LPAR = atok("("), RPAR = atok(")"), DOT = atok(".");
+		const int T_IF = atok("if"), T_ELSE = atok("else"), T_WHILE = atok("while"), T_FUNCTION = atok("function"), T_RETURN = atok("return"), T_THIS = atok("this");
 		const int ID = atok("   _ID_"), DNUM = atok("   _dnum_"), STR = atok("   __str__");
 		int USER;
 
@@ -592,10 +614,12 @@ namespace nanoes {
 			}
 
 			while (-1 != (tt = lexpeek(ctx))) {
+				if (tt < prec)
+					break;
 				if (ADD == tt) {
 					lexeat(ctx);
 					deref(); // deref any references since we only want a value
-					OP sub = expr(tt, ctx, ADD); // TODO: change precence req
+					OP sub = expr(tt, ctx, MUL); // TODO: change precence req
 					val = ctx.add_op([val = std::move(val), sub = std::move(sub)](slot& rv, scope *scope) {
 						slot lr;
 						val->invoke(lr, scope);
@@ -616,7 +640,7 @@ namespace nanoes {
 					int op = tt;
 					lexeat(ctx);
 					deref();
-					OP right = expr(tt, ctx, 0);
+					OP right = expr(tt, ctx, T_SUB == op ? MUL : T_MOD + 1);
 					if (T_DIV == op) {
 						val = add_arith(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a / b; });
 					} else if (T_SUB == op) {
@@ -630,7 +654,7 @@ namespace nanoes {
 					int op = tt;
 					lexeat(ctx);
 					deref();
-					OP right = expr(tt, ctx, 0);
+					OP right = expr(tt, ctx, (EQ == op || NEQ == op) ? LT : GT + 1);
 					if (LT == op)
 						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a < b; }, [](const auto& a, const auto& b)->bool { throw std::runtime_error("Cannot < compare a bool"); });
 					else if (LEQ == op)

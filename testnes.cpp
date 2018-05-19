@@ -31,6 +31,10 @@ int main() {
 	rt.eval(R"-(
 		print("Should be 2:"+(1+1));
 		print("Should be 2:"+(3-1));
+		print("Should be 7:" +(1+2*3));
+		print("Should be 11:"+(1+2*3+4));
+		print("Should be 27:"+(1+2*3+4*5));
+		print("Should be 33:"+(1+2*3+4*5+6));
 	)-");
 	rt.eval(R"-(
 		print("Smaller? Y:"+(1 < 2));

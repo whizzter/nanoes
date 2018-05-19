@@ -821,6 +821,31 @@ namespace nanoes {
 			return STATUS::OK;
 		}
 
+		enum class OPC  {
+			RETURN = 0,
+			PUSHINT,   // one value (high 24 bits is the number)
+			PUSHDOUBLE,  // 2 following values that are low/high bits
+			PUSHLIT,     // high 24 bits is an literal stored inside the function!
+			PUSHGLOB,    // ID as key? (hmm...)
+			PUSHSCOPE,   // (12:12 bits) for up/offset
+			INVOKE,      // high 24 bits is argcount
+			ADD, SUB, MUL, DIV, MOD, // pops 2 and computes something.
+			LT
+		};
+		VAL runblock(int32_t *ops) {
+			scope **cur;
+			while (true) {
+				int eop = *ops++,op;
+				switch ((OPC)(op = eop & 0xff)) {
+				case OPC::PUSHDOUBLE :
+
+				default:
+					throw std::exception("Bad state!");
+				}
+			}
+		}
+
+
 		template<class MF>
 		OP add_arith(parsectx&ctx, OP lop, OP rop, const MF & mf) {
 			return ctx.add_op(2+std::max(tsize_op(lop),tsize_op(rop)),[this,lop = std::move(lop), rop = std::move(rop), mf](scope **scope,int roff) {
@@ -855,6 +880,8 @@ namespace nanoes {
 				return STATUS::OK;
 			});
 		}
+
+
 
 		std::shared_ptr<nfun> parse_fun(parsectx & ctx, bool statement) {
 
@@ -1238,6 +1265,7 @@ namespace nanoes {
 		}
 	};
 
+
 	inline runtime::VAL runtime::nfun::invoke(int argc, VAL *args)
 	{
 		// create local scope if the functions scope is local.
@@ -1258,6 +1286,7 @@ namespace nanoes {
 		runblock(&fnscope,tmp.off, top);
 		return tmp[0];
 	}
+
 };
 
 

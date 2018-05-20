@@ -61,9 +61,6 @@ int main() {
 			print("smaller should run\n");
 		}
 	)-");
-#endif
-
-#if 1
 	// identifier scoping location.
 	rt.eval(R"-(
 		dummy("ARG VALUE");
@@ -71,10 +68,20 @@ int main() {
 			print("want arg not global ? -> "+xstr);
 		}
 	)-");
+#endif
+
+#if 1
+	rt.eval(R"-(
+		print("should return 123:"+ret123());
+		function ret123(x) {
+			return 123;
+		}
+	)-");
+
 	// finally time the fibonacchi
 	double start = clock();
 	rt.eval(R"-(
-		print("fib 12:"+fib(12));
+		print("fib 35:"+fib(35));
 		function fib(x) {
 			if (x<2) {
 				return x;

@@ -33,6 +33,7 @@
 //            ^- seems brilliant, could be a tad slow, could just make it 2-pass for function blocks (or per-script 2 pass with an initial pass of fun/binding recording)
 
 namespace nanoes {
+	class runtime;
 
 	template<class T>
 	intptr_t id_all() {
@@ -52,6 +53,51 @@ namespace nanoes {
 	intptr_t id() {
 		return id_all<std::remove_const<std::remove_reference<T>::type>::type>();
 	}
+
+	// Values are stored as NUN tagged 64 bit ints
+	// If the high 32bits are clear then we have an object reference
+	// where the lowest bit is a semi-space index and the rest is an offset into that space.
+	// otherwise the 64bit number is an double that gets it's value by XOR:ing the specific NAN pattern.
+	typedef int64_t VAL;
+	static constexpr const int64_t NUNPAT = 0xfffff00f00000000LL;
+
+	class nesvalue {
+		friend class runtime;
+		runtime *rt;
+		nesvalue *prev,*next;
+		VAL value;
+		void unlink() {
+			if (prev) {
+				prev->next = next;
+				next->prev = prev;
+				next = prev = nullptr;
+			}
+		}
+		void link(nesvalue &other) {
+			next = &other;
+			prev = other.prev;
+			prev->next = this;
+			next->prev = this;
+		}
+		nesvalue(runtime *in_rt) : prev(this), next(this), rt(in_rt), value(NUNPAT) {}
+	public:
+		nesvalue(const nesvalue& other) : rt(other.rt),value(other.value) {
+			link(const_cast<nesvalue&>(other));
+		}
+		nesvalue& operator=(const nesvalue& other) {
+			if (rt != other.rt) {
+				unlink();
+				link(const_cast<nesvalue&>(other));
+				rt = other.rt;
+			}
+			value = other.value;
+			return *this;
+		}
+		// TODO: operators for boxing/unboxing
+		~nesvalue() {
+			unlink();
+		}
+	};
 
 	class runtime {
 		class gcbase;
@@ -124,9 +170,15 @@ namespace nanoes {
 		std::vector<std::pair<int, std::string>> toks;
 		int nextTok = 256;
 		int atok(const char* v) {
-			int out = nextTok++;
-			toks.emplace_back(out, v);
-			return out;
+			auto where = std::find_if(toks.begin(), toks.end(), [&](std::pair<int, std::string>& k) { return v == k.second; });
+			if (where == toks.end()) {
+				int out = nextTok++;
+				toks.emplace_back(out, v);
+				toksort();
+				return out;
+			} else {
+				return where->first;
+			}
 		}
 
 		// 1 : seq
@@ -235,7 +287,6 @@ namespace nanoes {
 				while (sym(*state, false))
 					ctx.tok.push_back(*state++);
 				int rv = atok(ctx.tok.c_str());
-				toksort();
 				return rv;
 			} else if (*state == 0) {
 				ctx.tok = "<END OF FILE>";
@@ -254,19 +305,6 @@ namespace nanoes {
 			return rv;
 		}
 
-		enum class STATUS {
-			OK,
-			RETURN,
-			BREAK,
-			CONTINUE
-		};
-
-		// Values are stored as NUN tagged 64 bit ints
-		// If the high 32bits are clear then we have an object reference
-		// where the lowest bit is a semi-space index and the rest is an offset into that space.
-		// otherwise the 64bit number is an double that gets it's value by XOR:ing the specific NAN pattern.
-		typedef int64_t VAL;
-		static constexpr const int64_t NUNPAT = 0xfffff00f00000000LL;
 		// helper union for boxing/unboxing
 		union VBOX {
 			int64_t i64v;
@@ -387,7 +425,7 @@ namespace nanoes {
 		struct scopeinfo {
 			std::shared_ptr<scopeinfo> parent = nullptr;
 			std::vector<std::pair<int, std::string>> names;
-			int max=0;
+			size_t max=0;
 			bool local = true; // does variables in this scope escape? in that case we always need to allocate these scopes on the heap!
 		};
 
@@ -419,30 +457,10 @@ namespace nanoes {
 			scopeinfo *info;
 
 			VAL* slots;
-			int sp;
 
-			struct scares {
-				scope **mscope;
-				int off;
-				int sz;
-				scares(scope**inscope, int x) : mscope(inscope),off((*inscope)->sp),sz(x) {
-					(*mscope)->sp += sz;
-				}
-				~scares() {
-					(*mscope)->sp -= sz;
-				}
-				VAL& operator[](int idx) {
-#ifdef _DEBUG
-					if (off + idx < 0 || off + idx >= (*mscope)->info->max)
-						throw std::runtime_error("Error, out of bounds!");
-#endif
-					return (*mscope)->slots[off + idx];
-				}
-			};
-
-			scope(VAL* islots, scopeinfo *in_info) : slots(islots), info(in_info),sp(in_info->names.size()) {
+			scope(VAL* islots, scopeinfo *in_info) : slots(islots), info(in_info) {
 				if (islots)
-					for (int i = 0;i < in_info->max;i++)
+					for (size_t i = 0;i < in_info->max;i++)
 						islots[i] = NUNPAT; // nunpat flips to zero
 			}
 		};
@@ -463,30 +481,14 @@ namespace nanoes {
 			}
 		};
 
-		struct opbase {
-			virtual STATUS invoke(scope **,int roff) = 0;
-			virtual int sym() { return -1; }
-			virtual ~opbase() {}
-			virtual int tsize() { return 0; }
-		};
-		typedef std::unique_ptr<opbase> OP;
-		int tsize_block(std::vector<OP>& block) {
-			return std::accumulate(block.begin(), block.end(), 0, [](auto prev, auto& or ) {
-				return std::max(prev, or?or->tsize():0);
-			});
-		}
-		int tsize_op(OP& op) {
-			if (!op)
-				return 0;
-			return op->tsize();
-		}
 
 		VAL V_TRUE;  // TODO: set and collect
 		VAL V_FALSE; // TODO: set and collect
 		VAL V_NULL;  // TODO: set and collect
+		nesvalue uroot{ this };
 
 		template<class T>
-		void touch(T* &v) {
+		void touch(T* &v,bool allownew=false) {
 			gcbase *old = v;
 			if (!old)
 				return; // no need updating null ptrs..
@@ -498,8 +500,11 @@ namespace nanoes {
 #ifdef NANOES_GC_VERBOSE
 			std::cout << "Moving a " << typeid(T).name() << " from " << (void*)v << "  ";
 #endif
-			if (!heap[aHeap ^ 1].owns(old))
+			if (!heap[aHeap ^ 1].owns(old)) {
+				if (allownew)
+					return;
 				throw std::exception("target not in old-gen");
+			}
 			if (heap[aHeap ^ 1].owns(&v))
 				throw std::exception("old-loc is in old-gen");
 			space *tospace = heap + aHeap;
@@ -522,14 +527,14 @@ namespace nanoes {
 			std::cout << "was moved to " << (void*)v << std::endl;
 #endif
 		}
-		void touch(VAL& vr) {
+		void touch(VAL& vr,bool allownew=false) {
 			// only need to work on pointers, so change to a pointer and then rebase it..
 			if (auto *p = to_ptr(vr)) {
-				touch(p);
+				touch(p,allownew);
 				vr=ptr_to_val(p);
 			}
 		}
-		void collect(scope ** ss) {
+		void collect() {
 #ifdef NANOES_GC_VERBOSE
 			std::cout << "***** Begun collection" << std::endl;
 #endif
@@ -544,6 +549,12 @@ namespace nanoes {
 			for (auto& glob : global) {
 				touch(glob.second);
 			}
+			// mark the user root set.
+			nesvalue *croot = &uroot;
+			do {
+				touch(croot->value);
+				croot = croot->next;
+			} while (croot != &uroot);
 			// mark the active stack frames.
 			frame *t = activeframe;
 			while (t) {
@@ -574,38 +585,6 @@ namespace nanoes {
 			std::cout << "Occupacy:" << occ << " Tot:" << tospace->sz << "(" << (100.f*occ / (float)tospace->sz) <<")"<< std::endl;
 #endif
 		}
-
-
-		class funtpl {
-			friend runtime;
-			runtime *rt;
-			std::pair<int, std::string> id;
-			std::shared_ptr<scopeinfo> info;
-			int argcount;
-			std::vector<OP> top;
-		public:
-			funtpl(runtime *in_rt,std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, std::vector<OP> && in_top) : rt(in_rt),id(in_id), argcount(in_argcount), info(in_si), top(std::forward<std::vector<OP>>(in_top)) {}
-		};
-		struct funinst : valuebase {
-			std::shared_ptr<funtpl> code;
-			funtpl* qp;
-			scope * parent;
-			funinst(scope *in_parent,const std::shared_ptr<funtpl>& in_code) : parent(in_parent),code(in_code),qp(in_code.get()) {}
-			virtual ~funinst() {}
-			virtual size_t size() { return sizeof(*this); }
-			virtual size_t align() { return alignof(decltype(*this)); }
-			virtual void moveto(void *p) { ::new(p) funinst(std::move(*this)); }
-			virtual void touch(toucher& to) { to.touch(parent); } // TODO
-			virtual intptr_t ty() { return id<funinst>(); }
-			virtual void * get() { return nullptr; } // no embedded objects here
-
-			virtual VAL invoke(runtime &rt, int argc, VAL * args);
-			virtual std::string to_string() { return "<FUNCTION...>"; }
-			virtual double to_num() { return 0; }
-			virtual bool truthy() {
-				return true;
-			}
-		};
 
 		template<class T>
 		class value : public valuebase {
@@ -707,10 +686,10 @@ namespace nanoes {
 
 
 		template<class T>
-		inline typename std::enable_if< std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv,scope** sa) {
+		inline typename std::enable_if< std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv) {
 			T *p = heap[aHeap].findfree<T>();
 			if (!p) {
-				collect(sa);
+				collect();
 				p = heap[aHeap].findfree<T>();
 				if (!p) {
 					throw std::runtime_error(std::string("Out of GC heap while trying to allocate an ")+std::string(typeid(T).name()));
@@ -729,8 +708,8 @@ namespace nanoes {
 			return ptr_to_val(p);
 		}
 		template<class T>
-		inline typename std::enable_if< !std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv, scope** sa) {
-			return box(value<T>(std::move(iv)),sa);
+		inline typename std::enable_if< !std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv) {
+			return box(value<T>(std::move(iv)));
 		}
 
 		inline VAL box(double v) {
@@ -749,14 +728,138 @@ namespace nanoes {
 			return box((double)v);
 		}
 
+		enum class OPC : uint8_t {
+			URETURN=0,
+			RETURN,
+			LOADINT,      // 2 value : next 12 is target-slot
+			LOADDOUBLE,   // 3 values, 12 bits of target slot, 2 following values that are low/high bits
+			LOADLIT,      // 1 value : 8bits op, 12bit target, ????
+			LOADGLOB,     // 2 values :8bits op, 12bits target, 64bit ptr (only low 32bit loaded on 32bit arch)
+			LOADNULL,     // 1 value  : 8bits op, 12bits target
+			LOADTRUE,
+			LOADFALSE,
+			MOV,          // 2 values :8bits op, 12bits target, 12bits: next 12bits up (ignore masking initially!)
+			INVOKE,       // 1 value : 8bit ops, 12bits base, 12 bits count
+			ADD, SUB, MUL, DIV, MOD, // pops 2 and computes something. (8bit op, 12bit target, 12bit other)
+			LT, LEQ, GEQ, GT, EQ, NEQ,
+			FGOTO,        // 1 value : 8bit op, 12bit slot, 12bit jump offset
+			GOTO          // 1 value : 8bit op, 12bit ????, 12bit jump offset
+		};
+
+		struct fungenctx {
+			std::vector<int32_t> code;
+			std::vector<nesvalue> literals;
+			size_t sp = 0;
+		};
+
+		class funtpl {
+			friend runtime;
+			runtime *rt;
+			std::pair<int, std::string> id;
+			std::shared_ptr<scopeinfo> info;
+			int argcount;
+			std::vector<int32_t> code;
+			std::vector<nesvalue> literals;
+			std::string src;
+		public:
+			funtpl(runtime *in_rt, std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, fungenctx & in_gctx,std::string&& insrc)
+				: rt(in_rt), id(in_id), argcount(in_argcount), info(in_si),code(std::move(in_gctx.code)),literals(in_gctx.literals),src(insrc)
+			{}
+		};
+		struct funinst : valuebase {
+			std::shared_ptr<funtpl> code;
+			funtpl* qp;
+			scope * parent;
+			funinst(scope *in_parent, const std::shared_ptr<funtpl>& in_code) : parent(in_parent), code(in_code), qp(in_code.get()) {}
+			virtual ~funinst() {}
+			virtual size_t size() { return sizeof(*this); }
+			virtual size_t align() { return alignof(decltype(*this)); }
+			virtual void moveto(void *p) { ::new(p) funinst(std::move(*this)); }
+			virtual void touch(toucher& to) {
+				to.touch(parent);
+			}
+			virtual intptr_t ty() { return id<funinst>(); }
+			virtual void * get() { return nullptr; } // no embedded objects here
+
+			virtual VAL invoke(runtime &rt, int argc, VAL * args);
+			virtual std::string to_string() { return "<FUNCTION...>"; }
+			virtual double to_num() { return 0; }
+			virtual bool truthy() {
+				return true;
+			}
+		};
+
 		struct parsectx {
+			runtime * rt;
 			const char *state;
 			std::string tok;
 
+			parsectx(runtime *inrt):rt(inrt) {
+//				assert(!rt->cureval);
+//				rt->cureval = this;
+			}
+//			~parsectx() {
+//				rt->cureval = nullptr;
+//			}
+
 			std::vector<std::pair<scopeinfo*, int>> accesses;
 			std::vector<std::pair<const char*, std::shared_ptr<scopeinfo>>> scopes;
+			std::shared_ptr<scopeinfo> topscope = nullptr;
 			std::shared_ptr<scopeinfo> curscope = nullptr;
 			bool prep = true;
+
+			std::map<void*, int> cgmem;
+			fungenctx * gctx;
+
+			void add(int32_t v) {
+				gctx->code.push_back(v);
+			}
+			void add(int64_t v) {
+				add(int32_t(v));
+				add(int32_t(v >> 32));
+			}
+			void addglob(const std::string& tok) {
+				int id = rt->atok(tok.c_str());
+				if (sizeof(int64_t) == sizeof(void*)) {
+					int64_t addr = (int64_t)&(rt->global[id]);
+					add(addr);
+				} else if (sizeof(int32_t) == sizeof(void*)) {
+					int32_t addr = (int32_t)&(rt->global[id]);
+					add(addr);
+				} else abort();
+			}
+			int addlit(const std::string& v) {
+				int lid = gctx->literals.size();
+				gctx->literals.emplace_back(rt->uroot);
+				gctx->literals[lid].value = rt->box<std::string>(std::string(v));
+				return lid;
+			}
+			void add(OPC a,int32_t b=0,int32_t c=0,bool reladdr=false) {
+				if (reladdr) {
+					c -= gctx->code.size() + 1;
+				}
+				add(((int)a) | (b << 8) | (c << 20));
+			}
+			int label() {
+				return gctx->code.size();
+			}
+
+			struct spres {
+				parsectx *ctx;
+				size_t off;
+				size_t sz;
+				spres(parsectx &ictx, int x) : ctx(&ictx), off(ctx->gctx->sp), sz(x) {
+					ctx->gctx->sp += sz;
+					scopeinfo * ascope = ctx->curscope ? ctx->curscope.get() : ctx->topscope.get();
+					ascope->max = std::max(ctx->gctx->sp, ascope->max);
+
+				}
+				~spres() {
+					ctx->gctx->sp -= sz;
+					assert(ctx->gctx->sp == off);
+				}
+			};
+
 
 			std::shared_ptr<scopeinfo> enter_scope() {
 				auto loc = std::find_if(scopes.begin(), scopes.end(), [this](auto& v) { return v.first == state; });
@@ -794,111 +897,154 @@ namespace nanoes {
 				}
 				return std::make_pair(-1, -1);
 			}
-
-			template<class ROP>
-			OP add_op(int tsize,ROP && op, int sym = -1) {
-				if (prep) {
-					return nullptr;
-				} else {
-					struct OPS : opbase {
-						ROP data;
-						int symbol;
-						int mtsize;
-						virtual int sym() { return symbol; }
-						virtual int tsize() { return mtsize; }
-						virtual STATUS invoke(scope ** vscope,int off) {
-							return data(vscope,off);
-						}
-						OPS(int tsize, ROP&& ind, int insym) : mtsize(tsize), data(std::forward<ROP>(ind)), symbol(insym) {}
-					};
-					return std::make_unique<OPS>(tsize,std::forward<ROP>(op), sym);
-				}
-			}
 		};
 
-
-		static inline STATUS runblock(scope **scope,int roff, const std::vector<OP>& iops) {
-			size_t sz = iops.size();
-			auto ops = iops.data();
-			for (size_t i = 0;i <sz;i++) {
-				switch (ops[i]->invoke(scope,roff)) {
-				case STATUS::OK:
-					continue;
-				case STATUS::RETURN:
-					return STATUS::RETURN;
-				case STATUS::BREAK:
-					return STATUS::BREAK;
-				case STATUS::CONTINUE:
-					return STATUS::CONTINUE;
-				default:
-					abort();
-				}
-			}
-			return STATUS::OK;
-		}
-
-		enum class OPC  {
-			RETURN = 0,
-			PUSHINT,   // one value (high 24 bits is the number)
-			PUSHDOUBLE,  // 2 following values that are low/high bits
-			PUSHLIT,     // high 24 bits is an literal stored inside the function!
-			PUSHGLOB,    // ID as key? (hmm...)
-			PUSHSCOPE,   // (12:12 bits) for up/offset
-			INVOKE,      // high 24 bits is argcount
-			ADD, SUB, MUL, DIV, MOD, // pops 2 and computes something.
-			LT
-		};
-		VAL runblock(int32_t *ops) {
-			scope **cur;
-			while (true) {
-				int eop = *ops++,op;
-				switch ((OPC)(op = eop & 0xff)) {
-				case OPC::PUSHDOUBLE :
-
-				default:
-					throw std::exception("Bad state!");
-				}
-			}
-		}
-
-
-		template<class MF>
-		OP add_arith(parsectx&ctx, OP lop, OP rop, const MF & mf) {
-			return ctx.add_op(2+std::max(tsize_op(lop),tsize_op(rop)),[this,lop = std::move(lop), rop = std::move(rop), mf](scope **scope,int roff) {
-				scope::scares tmp(scope,2);
-				lop->invoke(scope,tmp.off);
-				rop->invoke(scope,tmp.off+1);
-				double dlv = unbox<double>(tmp[0]), drv = unbox<double>(tmp[1]);
-				(*scope)->slots[roff] = box(mf(dlv, drv));
-				return STATUS::OK;
-			});
-		}
+		
 		template<class RC, class EC>
-		OP add_cmp(parsectx&ctx, OP lop, OP rop, const RC & rcmp, const EC & ecmp) {
-			return ctx.add_op(2 + std::max(tsize_op(lop), tsize_op(rop)),[this,lop = std::move(lop), rop = std::move(rop), rcmp, ecmp](scope ** scope,int roff) {
-				scope::scares tmp(scope,2);
-				lop->invoke(scope,tmp.off);
-				rop->invoke(scope,tmp.off+1);
+		inline void do_cmp(VAL *slots, int off, const RC& rcmp, const EC& ecmp) {
+			valuebase *lp = to_ptr(slots[off+0]);
+			valuebase *rp = to_ptr(slots[off+1]);
+			std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
+			bool * lb = lp ? lp->get<bool>() : nullptr, *rb = rp ? rp->get<bool>() : nullptr;
+			if (ls && rs) {
+				slots[off] = rcmp(*ls, *rs) ? V_TRUE : V_FALSE;
+			} else if (lb && rb) {
+				// do a truthiness comparasion
+				slots[off] = ecmp(truthy(slots[off + 0]), truthy(slots[off + 1])) ? V_TRUE : V_FALSE;
+			} else if (lp && rp) {
+				// both objects!!
+				slots[off] = ecmp(lp, rp) ? V_TRUE : V_FALSE;
+//			} else { // only do this for both being doubles?
+//				double lnum = unbox<double>(slots[off+0]), rnum = unbox<double>(slots[off+1]);
+//				slots[off] =rcmp(lnum, rnum)?V_TRUE:V_FALSE;
+			} else {
+				throw std::exception("Tried comparing a number and a non-number value!");
+			}
+		}
 
-				valuebase *lp = to_ptr(tmp[0]);
-				valuebase *rp = to_ptr(tmp[1]);
-				std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
-				bool * lb = lp ? lp->get<bool>() : nullptr, *rb = rp ? rp->get<bool>() : nullptr;
-				if (ls && rs) {
-					(*scope)->slots[roff] = rcmp(*ls, *rs) ? V_TRUE : V_FALSE;
-				} else if (lb && rb) {
-					// do a truthiness comparasion
-					(*scope)->slots[roff] =ecmp(truthy(tmp[0]),truthy(tmp[1]))?V_TRUE:V_FALSE;
-				} else {
-					double lnum = unbox<double>(tmp[0]), rnum = unbox<double>(tmp[1]);
-					(*scope)->slots[roff] =rcmp(lnum, rnum)?V_TRUE:V_FALSE;
+		VAL runblock(funtpl *tpl,scope *cur,int32_t *ops) {
+			frame cframe(this, &cur);
+			while (true) {
+				int eop = *ops++;
+				OPC op;
+				switch (op = OPC(eop & 0xff)) {
+				case OPC::URETURN :
+				case OPC::RETURN: {
+					VAL rv = op == OPC::URETURN ? V_NULL : cur->slots[eop >> 8];
+					// after returning we clear out the stack-values so we don't hold extra references. (make it exception safe?)
+					for (size_t i = cur->info->names.size();i < cur->info->max;i++) {
+						cur->slots[i] = NUNPAT;
+					}
+					return rv;
 				}
-				return STATUS::OK;
-			});
+				case OPC::FGOTO: {
+					if (!truthy(cur->slots[(eop >> 8) & 0xfff])) {
+						ops += (eop >> 20);
+					}
+					continue;
+				}
+				case OPC::GOTO: {
+					ops += (eop >> 20);
+					continue;
+				}
+				case OPC::LOADNULL: {
+					cur->slots[eop >> 8] = V_NULL;
+					continue;
+				}
+				case OPC::INVOKE: {
+					int soff = (eop >> 8) & 0xfff;
+					auto val = invoke(*this, cur->slots[soff], eop >> 20, cur->slots + soff + 1);
+					cur->slots[soff] = val;
+					continue;
+				}
+				case OPC::LOADDOUBLE: {
+					cur->slots[eop >> 8] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+					ops += 2;
+					continue;
+				}
+				case OPC::LOADGLOB : {
+					if (sizeof(int64_t) == sizeof(void*)) {
+						VAL* p = (VAL*)(((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+						ops += 2;
+						cur->slots[eop >> 8] = *p;
+					} else if (sizeof(int32_t) == sizeof(void*)) {
+						VAL* p = (VAL*)*ops++;
+						cur->slots[eop >> 8] = *p;
+					} else abort();
+					continue;
+				}
+				case OPC::MOV: {
+					scope* fs = cur;
+					int up = *ops++;
+					while (up--) {
+						fs = fs->parent;
+					}
+					cur->slots[(eop >> 8)&0xfff] = fs->slots[eop >> 20];
+					continue;
+				}
+				case OPC::LOADLIT :
+					// 	(*scope)->slots[roff] = box(std::string(tok),scope);
+					cur->slots[(eop >> 8) & 0xfff] = tpl->literals[ eop>>20 ].value;
+						//box(std::string("<BADCONSTSTR>"));
+					continue;
+				case OPC::SUB:
+					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) - unbox<double>(cur->slots[1 + (eop >> 8)]));
+					continue;
+				case OPC::MUL:
+					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) * unbox<double>(cur->slots[1 + (eop >> 8)]));
+					continue;
+				case OPC::DIV:
+					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) / unbox<double>(cur->slots[1 + (eop >> 8)]));
+					continue;
+				case OPC::MOD:
+					cur->slots[eop >> 8] = box(std::fmod(unbox<double>(cur->slots[eop >> 8]),unbox<double>(cur->slots[1 + (eop >> 8)])));
+					continue;
+#define NANOES__RUNTIME__RUNBLOCK__CMP(EOP,ROP) \
+					if ((0xffffffff00000000LL&cur->slots[(eop >> 8)])&&(0xffffffff00000000LL&cur->slots[1 + (eop >> 8)])) { \
+						cur->slots[eop>>8]=( unbox<double>(cur->slots[eop >> 8]) EOP unbox<double>(cur->slots[1 + (eop >> 8)]) )?V_TRUE:V_FALSE; \
+					} else { \
+						do_cmp(cur->slots,eop>>8,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
+					} continue;
+				case OPC::LT:
+					NANOES__RUNTIME__RUNBLOCK__CMP(<, throw std::runtime_error("Cannot < compare a bool");)
+				case OPC::LEQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(<=, throw std::runtime_error("Cannot <= compare a bool");)
+				case OPC::GEQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(>=, throw std::runtime_error("Cannot >= compare a bool");)
+				case OPC::GT:
+					NANOES__RUNTIME__RUNBLOCK__CMP(>, throw std::runtime_error("Cannot > compare a bool");)
+				case OPC::EQ :
+					NANOES__RUNTIME__RUNBLOCK__CMP(==, return a==b;)
+				case OPC::NEQ :
+					NANOES__RUNTIME__RUNBLOCK__CMP(!= , return a != b;)
+				case OPC::ADD: {
+					int off = eop >> 8;
+					if ((0xffffffff00000000LL & cur->slots[off]) && (0xffffffff00000000LL & cur->slots[1 + off])) {
+						goto op_add_double;
+					}
+					valuebase *lp = to_ptr(cur->slots[off]);
+					valuebase *rp = to_ptr(cur->slots[off+1]);
+					std::string * ls = lp?lp->get<std::string>():nullptr, *rs = rp?rp->get<std::string>():nullptr;
+					if (ls || rs) {
+						std::string sl = unbox<std::string>(cur->slots[off]), sv = unbox<std::string>(cur->slots[off+1]);
+						std::string out = sl + sv;
+						cur->slots[off] = box<std::string>(std::move(out));
+					} else {
+					op_add_double:
+						double dlv = unbox<double>(cur->slots[off]), drv = unbox<double>(cur->slots[off+1]);
+						cur->slots[off] = box(dlv + drv);
+					}
+					continue;
+				}
+				default:
+					throw std::runtime_error("Bad state "+std::to_string(int(op)));
+				}
+			}
 		}
 
 		std::shared_ptr<funtpl> parse_fun(parsectx & ctx, bool statement) {
-
+			const char *srcstart = ctx.state;
+			lexeat(ctx); // eat function token
 			auto argscope = ctx.enter_scope(); // this enters the arg-scope.
 
 			int argcount = 1;
@@ -906,7 +1052,6 @@ namespace nanoes {
 
 			std::string & tok = ctx.tok;
 			auto id = std::make_pair(-1, std::string(""));
-			std::vector<OP> body;
 			// parse name part
 			int name = lexpeek(ctx);
 			if (name >= USER) {
@@ -914,6 +1059,9 @@ namespace nanoes {
 				id = std::make_pair(name, ctx.tok);
 			} else if (statement)
 				throw std::runtime_error("expected function name but found " + tok);
+
+			// store a key for our namecount 
+			void * namecountkey = (void*)ctx.state;
 			// next ensure we have parens for the argument list
 			if (LPAR != lexeat(ctx))
 				throw std::runtime_error("expected ( after function name but found " + tok);
@@ -934,65 +1082,67 @@ namespace nanoes {
 						throw std::runtime_error("expected , or ) after argument but found " + tok);
 				}
 			}
+			
+			// store some previous state.
+			fungenctx *ogctx= ctx.gctx;
+			// now setup things for our context.
+			fungenctx gctx;
+			ctx.gctx = &gctx;
+			gctx.sp = ctx.prep ? 0 : ctx.cgmem[namecountkey];
+			argscope->max = gctx.sp;
+
 			// check for a brace (the brace-pair will be parsed by the stmt parsing function)
 			if (LBRA != lexpeek(ctx))
 				throw std::runtime_error("expected { after function arguments but found " + tok);
-			stmt(body, ctx, -1);
+			// now parse the body
+			stmt(ctx, -1);
+
+			// always unconditinal return at end
+			ctx.add(OPC::URETURN);
+
+			// restore previous state
+			ctx.gctx = ogctx;
+
+			// memorize the number of names so we can calculate accurate stack positions next time.
+			if (ctx.prep)
+				ctx.cgmem[namecountkey] = argscope->names.size();
+
 			ctx.leave_scope();
-			argscope->max = 1+tsize_block(body) + argscope->names.size(); // reserve space for variables and tmps
-			return std::make_shared<funtpl>(this,id, argcount, argscope, std::move(body));
+			return std::make_shared<funtpl>(this,id, argcount, argscope, gctx,std::string(srcstart,ctx.state));
 		}
-		OP expr(int & tt, parsectx & ctx, int prec) {
+		std::unique_ptr<parsectx::spres> expr(int & tt, parsectx & ctx, int prec) {
 			std::string & tok = ctx.tok;
 			double dnum;
 			tt = lexeat(ctx, &dnum);
 			if (tt == -1)
 				return nullptr;
-			OP cont = nullptr;
-			OP val = nullptr;
-			auto deref = [this, &cont, &val, &ctx]()->void {
-				if (cont) {
-					val = ctx.add_op(tsize_op(cont)+tsize_op(val),[cont = std::move(cont), val = std::move(val)](scope **scope,int roff) {
-						// TODO: deref from cont/val pairs
-						abort();
-						return STATUS::OK;
-					});
-					cont = nullptr;
+			auto stack = std::make_unique<parsectx::spres>(ctx, 1);
+			
+			//OP cont = nullptr; OP val = nullptr; &cont, &val, 
+			auto deref = [&]()->void {
+				if (stack->sz != 1) {
+					// TODO: do something here?!
+					abort();
 				}
 			};
 			if (tt >= USER) {
 				auto info = ctx.access(tt);
 				if (info.first == -1) {
-					if (global.find(tt) == global.end())
-						global[tt] = NUNPAT;
-					auto slotptr = &(global[tt]);
-					val = ctx.add_op(0,[this, tt, slotptr](scope ** scope,int roff) {
-						(*scope)->slots[roff] =(*slotptr);
-						return STATUS::OK;
-					}, tt);
+					ctx.add(OPC::LOADGLOB, stack->off);
+					ctx.addglob(ctx.tok);
 				} else {
-					val = ctx.add_op(0,[info](scope ** inscope,int roff) {
-						int up = info.first;
-						scope* scope = *inscope;
-						while (up--) {
-							scope = scope->parent;
-						}
-						(*inscope)->slots[roff] =scope->slots[info.second];
-						return STATUS::OK;
-					}, tt);
+					ctx.add(OPC::MOV,stack->off,info.second);
+					ctx.add(info.first); // up stored
 				}
 			} else if (STR == tt) {
-				val = ctx.add_op(0,[this,tok](scope ** scope,int roff) {
-					(*scope)->slots[roff] = box(std::string(tok),scope);
-					return STATUS::OK;
-				});
+				ctx.add(OPC::LOADLIT, stack->off,ctx.addlit(tok)); // TODO: do value index..
+				//ctx.add(box<double>(dnum));
 			} else if (tt == DNUM) {
-				val = ctx.add_op(0,[this,dnum](scope ** scope,int roff) {
-					(*scope)->slots[roff] = box(dnum);
-					return STATUS::OK;
-				});
+				ctx.add(OPC::LOADDOUBLE, stack->off);
+				ctx.add(box(dnum));
 			} else if (tt == LPAR) {
-				val = expr(tt, ctx, 0);
+				stack.reset();
+				stack=expr(tt, ctx, 0);
 				tt = lexeat(ctx);
 				if (tt != RPAR)
 					throw std::runtime_error("Unexpected token in parenthised expression, wanted ) to end it but found " + ctx.tok);
@@ -1000,75 +1150,53 @@ namespace nanoes {
 				throw std::runtime_error("unknown primtok " + ctx.tok);
 			}
 
-			while (-1 != (tt = lexpeek(ctx))) {
+			operatorloop: while (-1 != (tt = lexpeek(ctx))) {
 				// don't handle operators with too low precendce when doing a higher level.
 				if (tt < prec)
 					break;
-				if (ADD == tt) {
-					lexeat(ctx);
-					deref(); // deref any references since we only want a value
-					OP sub = expr(tt, ctx, MUL); // TODO: change precence req
-					val = ctx.add_op(2+std::max(tsize_op(val),tsize_op(sub)),[this,val = std::move(val), sub = std::move(sub)](scope ** scope,int roff) {
-						scope::scares tmp(scope, 2);
-						val->invoke(scope,tmp.off);
-						sub->invoke(scope,tmp.off+1);
-						valuebase *lp = to_ptr(tmp[0]);
-						valuebase *rp = to_ptr(tmp[1]);
-						std::string * ls = lp?lp->get<std::string>():nullptr, *rs = rp?rp->get<std::string>():nullptr;
-						if (ls || rs) {
-							std::string sl = unbox<std::string>(tmp[0]), sv = unbox<std::string>(tmp[1]);
-							std::string out = sl + sv;
-							(*scope)->slots[roff]= box<std::string>(std::move(out),scope);
-						} else {
-							double dlv = unbox<double>(tmp[0]), drv = unbox<double>(tmp[1]);
-							(*scope)->slots[roff] = box(dlv + drv);
+				const std::tuple<int, int, OPC> binops[] = {
+					{ ADD,MUL,OPC::ADD },
+					{ T_SUB,MUL,OPC::SUB },
+					{ MUL,T_MOD + 1,OPC::MUL },
+					{ T_DIV,T_MOD + 1,OPC::DIV },
+					{ T_MOD,T_MOD + 1,OPC::MOD },
+					{ EQ,LT,OPC::EQ },
+					{ NEQ,LT,OPC::NEQ },
+					{ LT,GT + 1,OPC::LT },
+					{ LEQ,GT + 1,OPC::LEQ },
+					{ GEQ,GT + 1,OPC::GEQ },
+					{ GT,GT + 1,OPC::GT }
+				};
+				for (int boidx = (sizeof(binops) / sizeof(binops[0])) - 1;boidx != -1;boidx--)
+					if (std::get<0>(binops[boidx])==tt) {
+						lexeat(ctx); // eat the operator
+						deref(); // deref any references since we only want a value
+						std::unique_ptr<parsectx::spres> sub = expr(tt, ctx, std::get<1>(binops[boidx]) );
+						if (sub) {
+							assert(stack->off+1 == sub->off);
+							ctx.add(std::get<2>(binops[boidx]), stack->off);
 						}
-						return STATUS::OK;
-					});
-				} else if (T_DIV == tt || T_SUB == tt || T_MOD == tt || MUL == tt) {
-					int op = tt;
-					lexeat(ctx);
-					deref();
-					OP right = expr(tt, ctx, T_SUB==op?MUL:T_MOD+1);
-					if (T_DIV == op) {
-						val = add_arith(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a / b; });
-					} else if (T_SUB == op) {
-						val = add_arith(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a - b; });
-					} else if (T_MOD == op) {
-						val = add_arith(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return std::fmod(a, b); });
-					} else if (MUL == op) {
-						val = add_arith(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a * b; });
-					} else abort();
-				} else if (LT == tt || LEQ == tt || GEQ == tt || GT == tt || EQ == tt || NEQ == tt) {
-					int op = tt;
-					lexeat(ctx);
-					deref();
-					OP right = expr(tt, ctx, (EQ==op || NEQ==op)?LT:GT+1);
-					if (LT == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a < b; }, [](const auto& a, const auto& b)->bool { throw std::runtime_error("Cannot < compare a bool"); });
-					else if (LEQ == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a <= b; }, [](const auto& a, const auto& b)->bool { throw std::runtime_error("Cannot <= compare a bool"); });
-					else if (GEQ == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a >= b; }, [](const auto& a, const auto& b)->bool { throw std::runtime_error("Cannot >= compare a bool"); });
-					else if (GT == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a > b; }, [](const auto& a, const auto& b)->bool { throw std::runtime_error("Cannot > compare a bool"); });
-					else if (EQ == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a == b; }, [](const auto& a, const auto& b) { return a == b; });
-					else if (NEQ == op)
-						val = add_cmp(ctx, std::move(val), std::move(right), [](auto& a, auto& b) { return a != b; }, [](const auto& a, const auto& b) { return a != b; });
-					else abort();
-				} else if (LPAR == tt) {
+						goto operatorloop;
+					}
+				// not a simple binary operator...
+				if (LPAR == tt) {
 					// eat ( first
 					lexeat(ctx);
-					std::vector<OP> args;
-					args.push_back(std::move(cont));
-					args.push_back(std::move(val));
-					cont = nullptr;
+					std::unique_ptr<parsectx::spres> thstmp;
+					std::vector<std::unique_ptr<parsectx::spres>> targs;
+					if (stack->sz == 1) {
+						// no context given, only a fun-value
+						// reserve one slot for the "this" value to be loaded as null
+						thstmp = std::make_unique<parsectx::spres>(ctx, 1);
+						ctx.add(OPC::LOADNULL, thstmp->off);
+					} else {
+						abort();
+					}
 					if (RPAR == (tt = lexpeek(ctx, RPAR))) {
 					} else {
 						while (true) {
-							OP sub = expr(tt, ctx, 0);
-							args.push_back(std::move(sub));
+							auto sub = expr(tt, ctx, 0);
+							targs.push_back(std::move(sub));
 							tt = lexeat(ctx);
 							if (tt == -1)
 								return nullptr;
@@ -1076,36 +1204,20 @@ namespace nanoes {
 								continue;
 							else if (RPAR == tt)
 								break;
-							else throw std::runtime_error("Unexpected token in funcall, wanted ) or , but found " + ctx.tok);
+							else
+								throw std::runtime_error("Unexpected token in funcall, wanted ) or , but found " + ctx.tok);
 						}
 					}
-					int tsize = args.size() + tsize_block(args);
-					//std::accumulate(args.begin(), args.end(), 0, [](auto& acc, auto&item) {return acc + tsize_op(item);});
-					val = ctx.add_op(tsize,[this,args = std::move(args)](scope **scope,int roff) {
-						scope::scares tmp(scope,args.size());
-
-						if (args[0]) {
-							abort(); // TODO: "this-invoke"
-						} else {
-							tmp[1] = V_NULL;
-							args[1]->invoke(scope,tmp.off); // fetch fun.
-						}
-						for (size_t i = 2;i < args.size();i++) {
-							args[i ]->invoke(scope,tmp.off+i);
-						}
-
-						(*scope)->slots[roff]=invoke(*this,tmp[0],args.size()-1, &tmp[1]);
-						// scares destroys funvalue and args
-						return STATUS::OK;
-					});
+					// stack reserved for fun-call
+					ctx.add(OPC::INVOKE, stack->off, targs.size()+1);
 				} else {
 					break;
 				}
 			}
 			deref();
-			return std::move(val);
+			return std::move(stack);
 		}
-		int stmt(std::vector<OP> & seq, parsectx & ctx, int fnLvl) {
+		int stmt(parsectx & ctx, int fnLvl) {
 			std::string & tok = ctx.tok;
 
 			int tt = lexpeek(ctx);
@@ -1113,152 +1225,136 @@ namespace nanoes {
 				return -1;
 			if (LBRA == tt) {
 				lexeat(ctx);
-				std::vector<OP> subblock;
 				while (true) {
 					if (RBRA == lexpeek(ctx, RBRA))
 						break;
-					if (-1 == stmt(subblock, ctx, fnLvl + 1))
+					if (-1 == stmt(ctx, fnLvl + 1))
 						throw std::runtime_error("Premature EOF");
 				}
-				// TODO: check for scopes before just appending to the parent!
-				for (size_t i = 0;i < subblock.size();i++)
-					seq.push_back(std::move(subblock[i]));
 				return 1;
 			} else if (T_FUNCTION == tt && fnLvl == 0) {
-				lexeat(ctx); // eat function token
 				auto fn = parse_fun(ctx, true);
 				if (ctx.curscope) {
 					abort();
 				} else {
-					if (global.find(fn->id.first) == global.end())
-						global[fn->id.first] = NUNPAT;
-					auto slotptr = &(global[fn->id.first]);
-					seq.insert(seq.begin(), ctx.add_op(0,[this, fn, slotptr](scope ** ppscope,int roff) {
-						scope *outs = *ppscope;
-						(*slotptr) = box(std::move(funinst(outs->info->local?nullptr:outs,fn)), ppscope);
-						return STATUS::OK;
-					}));
+					// we're at the toplevel eval, just box the fun-value directly!
+					VAL v = box(std::move(funinst(nullptr, fn)));
+					// we assign separately since we don't want bogus ptr slots in the map
+					global[fn->id.first] = v;
 				}
 				return 1;
 			} else if (T_RETURN == tt) {
 				lexeat(ctx);
-				OP rexp;
+				std::unique_ptr<parsectx::spres> rexp;
 				if (SEMICOLON == lexpeek(ctx, SEMICOLON)) {
+					// no return expr, just generate a null value.
+					rexp = std::make_unique<parsectx::spres>(ctx, 1);
+					ctx.add(OPC::LOADNULL);
 				} else {
 					rexp = expr(tt, ctx, 0);
 					if (SEMICOLON != lexeat(ctx))
 						throw std::runtime_error("expected ; but found " + tok);
 				}
-				seq.push_back(ctx.add_op(rexp?tsize_op(rexp):0,[this,rexp = std::move(rexp)](scope ** scope,int roff){
-					if (rexp) {
-						rexp->invoke(scope,roff);
-					} else {
-						(*scope)->slots[roff] = V_NULL;
-					}
-					return STATUS::RETURN;
-				}));
+				ctx.add(OPC::RETURN,rexp->off);
 				return 1;
 			} else if (T_IF == tt) {
+				// we need 2 gotos... IF fail target (else or end), tcode-end-target (post else or directly after?)
+				void* if_fail_key = (void*)ctx.state; // use if token ptr as if_fail_key
 				lexeat(ctx);
 				if (LPAR != lexpeek(ctx))
 					throw std::runtime_error("expected ( after if but found " + tok);
-				auto cond = expr(tt, ctx, 0);
-				// right parenthesis will have been parsed as part of the expression!
-				std::vector<OP> tcode;
-				std::vector<OP> fcode;
-				stmt(tcode, ctx, fnLvl + 1);
+				auto condslot = expr(tt, ctx, 0);
+				// right parenthesis will have been parsed as part of the previous expression!
+				ctx.add(OPC::FGOTO, condslot->off, ctx.cgmem[if_fail_key], true);
+				// data in slot consumed!
+				condslot.reset();
+				stmt(ctx, fnLvl + 1);
 				if (T_ELSE == lexpeek(ctx, T_ELSE)) {
-					int rbr = stmt(fcode, ctx, fnLvl + 1);
+					void* fcode_end_key = (void*)ctx.state; // use left paren token ptr as tcode_end_key
+					ctx.add(OPC::GOTO, 0, ctx.cgmem[fcode_end_key], true);
+					ctx.cgmem[if_fail_key] = ctx.label();
+					int rbr = stmt(ctx, fnLvl + 1);
+					ctx.cgmem[fcode_end_key] = ctx.label();
+				} else {
+					ctx.cgmem[if_fail_key] = ctx.label();
 				}
-				int tsize = 1 + std::max(tsize_op(cond), std::max(tsize_block(tcode), tsize_block(fcode)));
-				seq.push_back(ctx.add_op(tsize, [this, cond = std::move(cond), tcode = std::move(tcode), fcode = std::move(fcode)](scope **scope, int roff) {
-					scope::scares tmp(scope, 1);
-					cond->invoke(scope, tmp.off);
-					if (truthy(tmp[0])) {
-						return runblock(scope, roff, tcode);
-					} else {
-						return runblock(scope, roff, fcode);
-					}
-				}));
 				return 1;
-			} else if (T_WHILE == tt) {
-				lexeat(ctx);
-				if (LPAR != lexpeek(ctx))
-					throw std::runtime_error("expected ( after while but found " + tok);
-				auto cond = expr(tt, ctx, 0);
-				// right parenthesis will have been parsed as part of the expression!
-				std::vector<OP> wcode;
-				stmt(wcode, ctx, fnLvl + 1);
-				int tsize = 1 + std::max(tsize_op(cond), tsize_block(wcode));
-				seq.push_back(ctx.add_op(tsize, [this, cond = std::move(cond), wcode = std::move(wcode)](scope **scope, int roff) {
-					scope::scares tmp(scope, 1);
-					while (true) {
-						cond->invoke(scope, tmp.off);
-						if (!truthy(tmp[0]))
-							break;
-						STATUS code = runblock(scope, roff, wcode);
-						// TODO: labels
-						if (code == STATUS::OK || code == STATUS::CONTINUE)
-							continue;
-						else if (code == STATUS::BREAK)
-							break;
-						else if (code == STATUS::RETURN)
-							return STATUS::RETURN;
-						else abort();
-					}
-					return STATUS::OK;
-				}));
-				return 1;
+			//} else if (T_WHILE == tt) {
+			//	lexeat(ctx);
+			//	if (LPAR != lexpeek(ctx))
+			//		throw std::runtime_error("expected ( after while but found " + tok);
+			//	auto cond = expr(tt, ctx, 0);
+			//	// right parenthesis will have been parsed as part of the expression!
+			//	std::vector<OP> wcode;
+			//	stmt(wcode, ctx, fnLvl + 1);
+			//	int tsize = 1 + std::max(tsize_op(cond), tsize_block(wcode));
+			//	seq.push_back(ctx.add_op(tsize, [this, cond = std::move(cond), wcode = std::move(wcode)](scope **scope, int roff) {
+			//		scope::scares tmp(scope, 1);
+			//		while (true) {
+			//			cond->invoke(scope, tmp.off);
+			//			if (!truthy(tmp[0]))
+			//				break;
+			//			STATUS code = runblock(scope, roff, wcode);
+			//			// TODO: labels
+			//			if (code == STATUS::OK || code == STATUS::CONTINUE)
+			//				continue;
+			//			else if (code == STATUS::BREAK)
+			//				break;
+			//			else if (code == STATUS::RETURN)
+			//				return STATUS::RETURN;
+			//			else abort();
+			//		}
+			//		return STATUS::OK;
+			//	}));
+			//	return 1;
 			}
 			auto op = expr(tt, ctx, 0);
 			if (SEMICOLON != lexeat(ctx))
 				throw std::runtime_error("expected ; but found " + tok);
-
-			seq.push_back(std::move(op));
 			return tt;
 		}
 	public:
 		template<class T>
 		void set(const std::string& id, T&& o) {
-			while (true) {
-				auto where = std::find_if(toks.begin(), toks.end(), [&](std::pair<int, std::string>& k) { return id == k.second; });
-				if (where == toks.end()) {
-					atok(id.c_str());
-					toksort();
-				} else {
-					scope *s = nullptr;
-					VAL v = box(std::move(o), &s);
-					global[where->first] = v;
-					return;
-				}
-			}
+			int iid = atok(id.c_str());
+			VAL v = box(std::move(o));
+			global[iid] = v;
 		}
 		void eval(const std::string & script, const char *src = "<EVAL>") {
-			// eval runs the parser twice to build a scope chain during the first pass.
-			parsectx ctx;
-			ctx.state = script.c_str();
-			std::vector<OP> top;
-			// run first pass of the parser.
-			while (-1 != stmt(top, ctx, 0)) {}
+			std::shared_ptr<funtpl> efn;
+			{
+				// eval runs the parser twice to build a scope chain during the first pass.
+				parsectx ctx(this);
+				ctx.rt = this;
+				ctx.state = script.c_str();
+				ctx.topscope = std::make_shared<scopeinfo>();
+				fungenctx gctx;
+				ctx.gctx = &gctx;
+				gctx.sp = 0;
+				// run first pass of the parser.
+				while (-1 != stmt(ctx, 0)) {}
 
-			// reset some things before the second iteration of the parser.
-			ctx.prep = false;           // turn off the prep-flag, this will cause memory to be allocated generated.
-			top.clear();                // reset the top code vector.
-			ctx.state = script.c_str(); // reset the parser ptr
-			ctx.tok.clear();            // clear the parsing token
-			ctx.curscope = nullptr;     // and ensure that we are at the toplevel scope (should not be unless there is parser bugs)
-			// also before the second pass we pre-dirty all scopes that has non-local variable accesses.
-			for (auto& acc : ctx.accesses) {
-				ctx.access(acc.second, acc.first);
+				assert(gctx.sp == 0);
+				assert(!ctx.curscope);
+				// reset some things before the second iteration of the parser.
+				ctx.prep = false;           // turn off the prep-flag, this will cause memory to be allocated generated.
+				gctx.code.clear();                // reset the top code vector.
+				gctx.literals.clear();       // remove the literals to re-gen them
+				ctx.state = script.c_str(); // reset the parser ptr
+				ctx.tok.clear();            // clear the parsing token
+				ctx.curscope = nullptr;     // and ensure that we are at the toplevel scope (should not be unless there is parser bugs)
+				// also before the second pass we pre-dirty all scopes that has non-local variable accesses.
+				for (auto& acc : ctx.accesses) {
+					ctx.access(acc.second, acc.first);
+				}
+				// now run second pass o the parser
+				while (-1 != stmt(ctx, 0)) {}
+				ctx.add(OPC::URETURN);
+				efn = std::make_shared<funtpl>(this, std::make_pair(-1, std::string()), 0, ctx.topscope, gctx,std::string(script));
 			}
-			// now run second pass o the parser
-			while (-1 != stmt(top, ctx, 0)) {}
-
 			// with the code generated, make a dummy fun and invoke it!
 			{
-				auto si = std::make_shared<scopeinfo>();
-				si->max = 1+tsize_block(top);
-				auto efn=std::make_shared<funtpl>(this,std::make_pair(-1, std::string()), 0, si, std::move(top));
+				// TODO: efin needs to be able to mark the literals...
 				funinst efin(nullptr, efn);
 				efin.invoke(*this,0, nullptr);
 			}
@@ -1271,17 +1367,16 @@ namespace nanoes {
 				heap[i].sz = semisize;
 				hptr[i] = heap[i].ptr - i; // hptr's are a bit offset to simplify 
 			}
-			scope *nscope = nullptr;
-			V_NULL = box((void*)nullptr,&nscope);
-			V_TRUE = box(true,&nscope);
-			V_FALSE = box(false, &nscope);
+			V_NULL = box((void*)nullptr);
+			V_TRUE = box(true);
+			V_FALSE = box(false);
 			toksort();
 			// end of built in tokens, register ID of first user-tok
 			USER = nextTok;
 		}
 	};
 
-	inline runtime::VAL runtime::funinst::invoke(runtime &rt,int argc, VAL *args)
+	inline VAL runtime::funinst::invoke(runtime &rt,int argc, VAL *args)
 	{
 		// create local scope if the functions scope is local.
 		bool is_local = qp->info->local;
@@ -1296,10 +1391,7 @@ namespace nanoes {
 		for (int i = 0;i < copyargs;i++) {
 			fnscope->slots[i] = args[i];
 		}
-		frame cur(&rt, &fnscope);
-		scope::scares tmp(&fnscope,1);
-		runblock(&fnscope,tmp.off, qp->top);
-		return tmp[0];
+		return rt.runblock(qp,fnscope, this->code->code.data());
 	}
 
 };

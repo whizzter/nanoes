@@ -576,7 +576,7 @@ namespace nanoes {
 		}
 
 
-		class nfun {
+		class funtpl {
 			friend runtime;
 			runtime *rt;
 			std::pair<int, std::string> id;
@@ -584,8 +584,27 @@ namespace nanoes {
 			int argcount;
 			std::vector<OP> top;
 		public:
-			nfun(runtime *in_rt,std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, std::vector<OP> && in_top) : rt(in_rt),id(in_id), argcount(in_argcount), info(in_si), top(std::forward<std::vector<OP>>(in_top)) {}
-			VAL invoke(int argc, VAL * args);
+			funtpl(runtime *in_rt,std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, std::vector<OP> && in_top) : rt(in_rt),id(in_id), argcount(in_argcount), info(in_si), top(std::forward<std::vector<OP>>(in_top)) {}
+		};
+		struct funinst : valuebase {
+			std::shared_ptr<funtpl> code;
+			funtpl* qp;
+			scope * parent;
+			funinst(scope *in_parent,const std::shared_ptr<funtpl>& in_code) : parent(in_parent),code(in_code),qp(in_code.get()) {}
+			virtual ~funinst() {}
+			virtual size_t size() { return sizeof(*this); }
+			virtual size_t align() { return alignof(decltype(*this)); }
+			virtual void moveto(void *p) { ::new(p) funinst(std::move(*this)); }
+			virtual void touch(toucher& to) { to.touch(parent); } // TODO
+			virtual intptr_t ty() { return id<funinst>(); }
+			virtual void * get() { return nullptr; } // no embedded objects here
+
+			virtual VAL invoke(runtime &rt, int argc, VAL * args);
+			virtual std::string to_string() { return "<FUNCTION...>"; }
+			virtual double to_num() { return 0; }
+			virtual bool truthy() {
+				return true;
+			}
 		};
 
 		template<class T>
@@ -610,9 +629,6 @@ namespace nanoes {
 					throw std::exception("Wrong script function arity");
 				}
 				return invoke_impl(rt,data, argc, args, std::make_index_sequence<sizeof...(ARGS)>{});
-			}
-			VAL invoke(runtime &rt, std::shared_ptr<nfun> &f, int argc, VAL *args) {
-				return f->invoke(argc, args);
 			}
 			template<class T>
 			VAL invoke(runtime &rt, T& ,int argc, VAL * args) {
@@ -881,9 +897,7 @@ namespace nanoes {
 			});
 		}
 
-
-
-		std::shared_ptr<nfun> parse_fun(parsectx & ctx, bool statement) {
+		std::shared_ptr<funtpl> parse_fun(parsectx & ctx, bool statement) {
 
 			auto argscope = ctx.enter_scope(); // this enters the arg-scope.
 
@@ -926,7 +940,7 @@ namespace nanoes {
 			stmt(body, ctx, -1);
 			ctx.leave_scope();
 			argscope->max = 1+tsize_block(body) + argscope->names.size(); // reserve space for variables and tmps
-			return std::make_shared<nfun>(this,id, argcount, argscope, std::move(body));
+			return std::make_shared<funtpl>(this,id, argcount, argscope, std::move(body));
 		}
 		OP expr(int & tt, parsectx & ctx, int prec) {
 			std::string & tok = ctx.tok;
@@ -1119,8 +1133,9 @@ namespace nanoes {
 					if (global.find(fn->id.first) == global.end())
 						global[fn->id.first] = NUNPAT;
 					auto slotptr = &(global[fn->id.first]);
-					seq.insert(seq.begin(), ctx.add_op(0,[this, fn, slotptr](scope ** scope,int roff) {
-						(*slotptr) = box(std::shared_ptr<nfun>(fn), scope);
+					seq.insert(seq.begin(), ctx.add_op(0,[this, fn, slotptr](scope ** ppscope,int roff) {
+						scope *outs = *ppscope;
+						(*slotptr) = box(std::move(funinst(outs->info->local?nullptr:outs,fn)), ppscope);
 						return STATUS::OK;
 					}));
 				}
@@ -1243,8 +1258,9 @@ namespace nanoes {
 			{
 				auto si = std::make_shared<scopeinfo>();
 				si->max = 1+tsize_block(top);
-				nfun efn(this,std::make_pair(-1, std::string()), 0, si, std::move(top));
-				efn.invoke(0, nullptr);
+				auto efn=std::make_shared<funtpl>(this,std::make_pair(-1, std::string()), 0, si, std::move(top));
+				funinst efin(nullptr, efn);
+				efin.invoke(*this,0, nullptr);
 			}
 		}
 
@@ -1265,25 +1281,24 @@ namespace nanoes {
 		}
 	};
 
-
-	inline runtime::VAL runtime::nfun::invoke(int argc, VAL *args)
+	inline runtime::VAL runtime::funinst::invoke(runtime &rt,int argc, VAL *args)
 	{
 		// create local scope if the functions scope is local.
-		bool is_local = info->local;
-		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*info->max) : nullptr;
-		scope local(is_local?localdata:nullptr, info.get());
+		bool is_local = qp->info->local;
+		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*qp->info->max) : nullptr;
+		scope local(is_local?localdata:nullptr, qp->info.get());
 		scope * fnscope = &local;
 		if (!is_local) {
 			abort(); // TODO, allocate a heap based scope instead! (hmm.... it could be feasible to do it just via a simple moveto since the logic is there...)
 		}
 		// TODO: varargs
-		int copyargs = std::min(argc, argcount);
+		int copyargs = std::min(argc, qp->argcount);
 		for (int i = 0;i < copyargs;i++) {
 			fnscope->slots[i] = args[i];
 		}
-		frame cur(rt, &fnscope);
+		frame cur(&rt, &fnscope);
 		scope::scares tmp(&fnscope,1);
-		runblock(&fnscope,tmp.off, top);
+		runblock(&fnscope,tmp.off, qp->top);
 		return tmp[0];
 	}
 

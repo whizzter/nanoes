@@ -400,9 +400,9 @@ namespace nanoes {
 			return (int)unbox<double>(v);
 		}
 
-		inline VAL invoke(runtime &rt,VAL fn, int arg, VAL* args) {
+		inline VAL invoke(VAL fn, int arg, VAL* args) {
 			if (valuebase *p = to_ptr(fn)) {
-				return p->invoke(rt, arg, args);
+				return p->invoke(*this, arg, args);
 			} else {
 				throw std::runtime_error(std::string("number ") + std::to_string(fn >> 1) + " is not a function");
 			}
@@ -781,12 +781,16 @@ namespace nanoes {
 			virtual intptr_t ty() { return id<funinst>(); }
 			virtual void * get() { return nullptr; } // no embedded objects here
 
-			virtual VAL invoke(runtime &rt, int argc, VAL * args);
 			virtual std::string to_string() { return "<FUNCTION...>"; }
 			virtual double to_num() { return 0; }
 			virtual bool truthy() {
 				return true;
 			}
+			static inline VAL invoke_impl(runtime *rt, funinst *fi, int argc, VAL *args);
+			virtual VAL invoke(runtime &rt, int argc, VAL *args) {
+				return invoke_impl(&rt, this, argc, args);
+			}
+
 		};
 
 		struct parsectx {
@@ -919,130 +923,6 @@ namespace nanoes {
 //				slots[off] =rcmp(lnum, rnum)?V_TRUE:V_FALSE;
 			} else {
 				throw std::exception("Tried comparing a number and a non-number value!");
-			}
-		}
-
-		VAL runblock(funtpl *tpl,scope *cur,int32_t *ops) {
-			frame cframe(this, &cur);
-			while (true) {
-				int eop = *ops++;
-				OPC op;
-				int ARG0 = (eop >> 8)&0xfff;
-				int ARG1 = (eop >> 20);
-				switch (op = OPC(eop & 0xff)) {
-				case OPC::URETURN :
-				case OPC::RETURN: {
-					VAL rv = op == OPC::URETURN ? V_NULL : cur->slots[ARG0];
-					// after returning we clear out the stack-values so we don't hold extra references. (make it exception safe?)
-					for (size_t i = cur->info->names.size();i < cur->info->max;i++) {
-						cur->slots[i] = NUNPAT;
-					}
-					return rv;
-				}
-				case OPC::FGOTO: {
-					if (!truthy(cur->slots[ARG0])) {
-						ops += ARG1;
-					}
-					continue;
-				}
-				case OPC::GOTO: {
-					ops += ARG1;
-					continue;
-				}
-				case OPC::LOADNULL: {
-					cur->slots[ARG0] = V_NULL;
-					continue;
-				}
-				case OPC::INVOKE: {
-					auto val = invoke(*this, cur->slots[ARG0], ARG1, cur->slots + ARG0 + 1);
-					cur->slots[ARG0] = val;
-					continue;
-				}
-				case OPC::LOADDOUBLE: {
-					cur->slots[ARG0] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
-					ops += 2;
-					continue;
-				}
-				case OPC::LOADGLOB : {
-					if (sizeof(int64_t) == sizeof(void*)) {
-						VAL* p = (VAL*)(((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
-						ops += 2;
-						cur->slots[ARG0] = *p;
-					} else if (sizeof(int32_t) == sizeof(void*)) {
-						VAL* p = (VAL*)*ops++;
-						cur->slots[ARG0] = *p;
-					} else abort();
-					continue;
-				}
-				case OPC::MOV: {
-					scope* fs = cur;
-					int up = *ops++;
-					while (up--) {
-						fs = fs->parent;
-					}
-					cur->slots[ARG0] = fs->slots[ARG1];
-					continue;
-				}
-				case OPC::LOADLIT :
-					cur->slots[ARG0] = tpl->literals[ ARG1 ].value;
-					continue;
-				case OPC::SUB:
-					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) - unbox<double>(cur->slots[1 + ARG0]));
-					continue;
-				case OPC::MUL:
-					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) * unbox<double>(cur->slots[1 + ARG0]));
-					continue;
-				case OPC::DIV:
-					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) / unbox<double>(cur->slots[1 + ARG0]));
-					continue;
-				case OPC::MOD:
-					cur->slots[ARG0] = box(std::fmod(unbox<double>(cur->slots[ARG0]),unbox<double>(cur->slots[1 + ARG0])));
-					continue;
-#define NANOES__RUNTIME__RUNBLOCK__CMP(EOP,ROP) \
-					if ((0xffffffff00000000LL&cur->slots[ARG0])&&(0xffffffff00000000LL&cur->slots[1 + ARG0])) { \
-						cur->slots[ARG0]=( unbox<double>(cur->slots[ARG0]) EOP unbox<double>(cur->slots[1 + ARG0]) )?V_TRUE:V_FALSE; \
-					} else { \
-						do_cmp(cur->slots,ARG0,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
-					}
-				case OPC::LT:
-					NANOES__RUNTIME__RUNBLOCK__CMP(<, throw std::runtime_error("Cannot < compare a bool");)
-					continue;
-				case OPC::LEQ:
-					NANOES__RUNTIME__RUNBLOCK__CMP(<=, throw std::runtime_error("Cannot <= compare a bool");)
-					continue;
-				case OPC::GEQ:
-					NANOES__RUNTIME__RUNBLOCK__CMP(>=, throw std::runtime_error("Cannot >= compare a bool");)
-					continue;
-				case OPC::GT:
-					NANOES__RUNTIME__RUNBLOCK__CMP(>, throw std::runtime_error("Cannot > compare a bool");)
-					continue;
-				case OPC::EQ :
-					NANOES__RUNTIME__RUNBLOCK__CMP(==, return a==b;)
-					continue;
-				case OPC::NEQ :
-					NANOES__RUNTIME__RUNBLOCK__CMP(!= , return a != b;)
-					continue;
-				case OPC::ADD: {
-					if ((0xffffffff00000000LL & cur->slots[ARG0]) && (0xffffffff00000000LL & cur->slots[1 + ARG0])) {
-						goto op_add_double;
-					}
-					valuebase *lp = to_ptr(cur->slots[ARG0]);
-					valuebase *rp = to_ptr(cur->slots[ARG0+1]);
-					std::string * ls = lp?lp->get<std::string>():nullptr, *rs = rp?rp->get<std::string>():nullptr;
-					if (ls || rs) {
-						std::string sl = unbox<std::string>(cur->slots[ARG0]), sv = unbox<std::string>(cur->slots[ARG0+1]);
-						std::string out = sl + sv;
-						cur->slots[ARG0] = box<std::string>(std::move(out));
-					} else {
-					op_add_double:
-						double dlv = unbox<double>(cur->slots[ARG0]), drv = unbox<double>(cur->slots[ARG0+1]);
-						cur->slots[ARG0] = box(dlv + drv);
-					}
-					continue;
-				}
-				default:
-					throw std::runtime_error("Bad state "+std::to_string(int(op)));
-				}
 			}
 		}
 
@@ -1370,22 +1250,152 @@ namespace nanoes {
 		}
 	};
 
-	inline VAL runtime::funinst::invoke(runtime &rt,int argc, VAL *args)
-	{
+	inline VAL runtime::funinst::invoke_impl(runtime *rt, funinst *fi, int argc, VAL *args) {
+		auto ftpl=fi->qp;
 		// create local scope if the functions scope is local.
-		bool is_local = qp->info->local;
-		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*qp->info->max) : nullptr;
-		scope local(is_local?localdata:nullptr, qp->info.get());
-		scope * fnscope = &local;
+		bool is_local = ftpl->info->local;
+		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*ftpl->info->max) : nullptr;
+		scope local(is_local?localdata:nullptr, ftpl->info.get());
+		scope * cur = &local;
 		if (!is_local) {
 			abort(); // TODO, allocate a heap based scope instead! (hmm.... it could be feasible to do it just via a simple moveto since the logic is there...)
 		}
 		// TODO: varargs
-		int copyargs = std::min(argc, qp->argcount);
+		int copyargs = std::min(argc, ftpl->argcount);
 		for (int i = 0;i < copyargs;i++) {
-			fnscope->slots[i] = args[i];
+			cur->slots[i] = args[i];
 		}
-		return rt.runblock(qp,fnscope, this->code->code.data());
+		//	return rt.runblock(qp,fnscope, this->code->code.data());
+		{
+			auto ops = ftpl->code.data();
+			frame cframe(rt, &cur);
+			VAL rv = NUNPAT;
+			while (true) {
+				int eop = *ops++;
+				OPC op;
+				int ARG0 = (eop >> 8) & 0xfff;
+				int ARG1 = (eop >> 20);
+				switch (op = OPC(eop & 0xff)) {
+				case OPC::URETURN: {
+					rv = rt->V_NULL;
+					goto eofun;
+				}
+				case OPC::RETURN: {
+					rv = cur->slots[ARG0];
+					goto eofun;
+				}
+				case OPC::FGOTO: {
+					if (!rt->truthy(cur->slots[ARG0])) {
+						ops += ARG1;
+					}
+					continue;
+				}
+				case OPC::GOTO: {
+					ops += ARG1;
+					continue;
+				}
+				case OPC::LOADNULL: {
+					cur->slots[ARG0] = rt->V_NULL;
+					continue;
+				}
+				case OPC::INVOKE: {
+					auto val = rt->invoke(cur->slots[ARG0], ARG1, cur->slots + ARG0 + 1);
+					cur->slots[ARG0] = val;
+					continue;
+				}
+				case OPC::LOADDOUBLE: {
+					cur->slots[ARG0] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+					ops += 2;
+					continue;
+				}
+				case OPC::LOADGLOB: {
+					if (sizeof(int64_t) == sizeof(void*)) {
+						VAL* p = (VAL*)(((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+						ops += 2;
+						cur->slots[ARG0] = *p;
+					} else if (sizeof(int32_t) == sizeof(void*)) {
+						VAL* p = (VAL*)*ops++;
+						cur->slots[ARG0] = *p;
+					} else abort();
+					continue;
+				}
+				case OPC::MOV: {
+					scope* fs = cur;
+					int up = *ops++;
+					while (up--) {
+						fs = fs->parent;
+					}
+					cur->slots[ARG0] = fs->slots[ARG1];
+					continue;
+				}
+				case OPC::LOADLIT:
+					cur->slots[ARG0] = ftpl->literals[ARG1].value;
+					continue;
+				case OPC::SUB:
+					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) - rt->unbox<double>(cur->slots[1 + ARG0]));
+					continue;
+				case OPC::MUL:
+					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) * rt->unbox<double>(cur->slots[1 + ARG0]));
+					continue;
+				case OPC::DIV:
+					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) / rt->unbox<double>(cur->slots[1 + ARG0]));
+					continue;
+				case OPC::MOD:
+					cur->slots[ARG0] = rt->box(std::fmod(rt->unbox<double>(cur->slots[ARG0]), rt->unbox<double>(cur->slots[1 + ARG0])));
+					continue;
+#define NANOES__RUNTIME__RUNBLOCK__CMP(EOP,ROP) \
+					if ((0xffffffff00000000LL&cur->slots[ARG0])&&(0xffffffff00000000LL&cur->slots[1 + ARG0])) { \
+						cur->slots[ARG0]=( rt->unbox<double>(cur->slots[ARG0]) EOP rt->unbox<double>(cur->slots[1 + ARG0]) )?rt->V_TRUE:rt->V_FALSE; \
+					} else { \
+						rt->do_cmp(cur->slots,ARG0,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
+					}
+				case OPC::LT:
+					NANOES__RUNTIME__RUNBLOCK__CMP(<, throw std::runtime_error("Cannot < compare a bool");)
+						continue;
+				case OPC::LEQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(<= , throw std::runtime_error("Cannot <= compare a bool");)
+						continue;
+				case OPC::GEQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(>= , throw std::runtime_error("Cannot >= compare a bool");)
+						continue;
+				case OPC::GT:
+					NANOES__RUNTIME__RUNBLOCK__CMP(>, throw std::runtime_error("Cannot > compare a bool");)
+						continue;
+				case OPC::EQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(== , return a == b;)
+						continue;
+				case OPC::NEQ:
+					NANOES__RUNTIME__RUNBLOCK__CMP(!= , return a != b;)
+						continue;
+				case OPC::ADD: {
+					if ((0xffffffff00000000LL & cur->slots[ARG0]) && (0xffffffff00000000LL & cur->slots[1 + ARG0])) {
+						goto op_add_double;
+					}
+					valuebase *lp = rt->to_ptr(cur->slots[ARG0]);
+					valuebase *rp = rt->to_ptr(cur->slots[ARG0 + 1]);
+					std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
+					if (ls || rs) {
+						std::string sl = rt->unbox<std::string>(cur->slots[ARG0]), sv = rt->unbox<std::string>(cur->slots[ARG0 + 1]);
+						std::string out = sl + sv;
+						cur->slots[ARG0] = rt->box<std::string>(std::move(out));
+					} else {
+					op_add_double:
+						double dlv = rt->unbox<double>(cur->slots[ARG0]), drv = rt->unbox<double>(cur->slots[ARG0 + 1]);
+						cur->slots[ARG0] = rt->box(dlv + drv);
+					}
+					continue;
+				}
+				default:
+					throw std::runtime_error("Bad state " + std::to_string(int(op)));
+				}
+			}
+		eofun:
+			// after returning we clear out the stack-values so we don't hold extra references. (make it exception safe?)
+			for (size_t i = cur->info->names.size();i < cur->info->max;i++) {
+				cur->slots[i] = NUNPAT;
+			}
+			return rv;
+		}
 	}
 
 };

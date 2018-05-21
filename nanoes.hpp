@@ -36,21 +36,21 @@ namespace nanoes {
 	class runtime;
 
 	template<class T>
-	intptr_t id_all() {
+	static intptr_t id_all() {
 		static int id;
 		return intptr_t(&id);
 	}
 	template<>
-	intptr_t id_all<int>() {
+	static intptr_t id_all<int>() {
 		return 1;
 	}
 	template<>
-	intptr_t id_all<double>() {
+	static intptr_t id_all<double>() {
 		return 2;
 	}
 
 	template<class T>
-	intptr_t id() {
+	static intptr_t id() {
 		return id_all<std::remove_const<std::remove_reference<T>::type>::type>();
 	}
 
@@ -927,10 +927,12 @@ namespace nanoes {
 			while (true) {
 				int eop = *ops++;
 				OPC op;
+				int ARG0 = (eop >> 8)&0xfff;
+				int ARG1 = (eop >> 20);
 				switch (op = OPC(eop & 0xff)) {
 				case OPC::URETURN :
 				case OPC::RETURN: {
-					VAL rv = op == OPC::URETURN ? V_NULL : cur->slots[eop >> 8];
+					VAL rv = op == OPC::URETURN ? V_NULL : cur->slots[ARG0];
 					// after returning we clear out the stack-values so we don't hold extra references. (make it exception safe?)
 					for (size_t i = cur->info->names.size();i < cur->info->max;i++) {
 						cur->slots[i] = NUNPAT;
@@ -938,27 +940,26 @@ namespace nanoes {
 					return rv;
 				}
 				case OPC::FGOTO: {
-					if (!truthy(cur->slots[(eop >> 8) & 0xfff])) {
-						ops += (eop >> 20);
+					if (!truthy(cur->slots[ARG0])) {
+						ops += ARG1;
 					}
 					continue;
 				}
 				case OPC::GOTO: {
-					ops += (eop >> 20);
+					ops += ARG1;
 					continue;
 				}
 				case OPC::LOADNULL: {
-					cur->slots[eop >> 8] = V_NULL;
+					cur->slots[ARG0] = V_NULL;
 					continue;
 				}
 				case OPC::INVOKE: {
-					int soff = (eop >> 8) & 0xfff;
-					auto val = invoke(*this, cur->slots[soff], eop >> 20, cur->slots + soff + 1);
-					cur->slots[soff] = val;
+					auto val = invoke(*this, cur->slots[ARG0], ARG1, cur->slots + ARG0 + 1);
+					cur->slots[ARG0] = val;
 					continue;
 				}
 				case OPC::LOADDOUBLE: {
-					cur->slots[eop >> 8] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+					cur->slots[ARG0] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
 					ops += 2;
 					continue;
 				}
@@ -966,10 +967,10 @@ namespace nanoes {
 					if (sizeof(int64_t) == sizeof(void*)) {
 						VAL* p = (VAL*)(((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
 						ops += 2;
-						cur->slots[eop >> 8] = *p;
+						cur->slots[ARG0] = *p;
 					} else if (sizeof(int32_t) == sizeof(void*)) {
 						VAL* p = (VAL*)*ops++;
-						cur->slots[eop >> 8] = *p;
+						cur->slots[ARG0] = *p;
 					} else abort();
 					continue;
 				}
@@ -979,60 +980,63 @@ namespace nanoes {
 					while (up--) {
 						fs = fs->parent;
 					}
-					cur->slots[(eop >> 8)&0xfff] = fs->slots[eop >> 20];
+					cur->slots[ARG0] = fs->slots[ARG1];
 					continue;
 				}
 				case OPC::LOADLIT :
-					// 	(*scope)->slots[roff] = box(std::string(tok),scope);
-					cur->slots[(eop >> 8) & 0xfff] = tpl->literals[ eop>>20 ].value;
-						//box(std::string("<BADCONSTSTR>"));
+					cur->slots[ARG0] = tpl->literals[ ARG1 ].value;
 					continue;
 				case OPC::SUB:
-					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) - unbox<double>(cur->slots[1 + (eop >> 8)]));
+					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) - unbox<double>(cur->slots[1 + ARG0]));
 					continue;
 				case OPC::MUL:
-					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) * unbox<double>(cur->slots[1 + (eop >> 8)]));
+					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) * unbox<double>(cur->slots[1 + ARG0]));
 					continue;
 				case OPC::DIV:
-					cur->slots[eop >> 8] = box(unbox<double>(cur->slots[eop >> 8]) / unbox<double>(cur->slots[1 + (eop >> 8)]));
+					cur->slots[ARG0] = box(unbox<double>(cur->slots[ARG0]) / unbox<double>(cur->slots[1 + ARG0]));
 					continue;
 				case OPC::MOD:
-					cur->slots[eop >> 8] = box(std::fmod(unbox<double>(cur->slots[eop >> 8]),unbox<double>(cur->slots[1 + (eop >> 8)])));
+					cur->slots[ARG0] = box(std::fmod(unbox<double>(cur->slots[ARG0]),unbox<double>(cur->slots[1 + ARG0])));
 					continue;
 #define NANOES__RUNTIME__RUNBLOCK__CMP(EOP,ROP) \
-					if ((0xffffffff00000000LL&cur->slots[(eop >> 8)])&&(0xffffffff00000000LL&cur->slots[1 + (eop >> 8)])) { \
-						cur->slots[eop>>8]=( unbox<double>(cur->slots[eop >> 8]) EOP unbox<double>(cur->slots[1 + (eop >> 8)]) )?V_TRUE:V_FALSE; \
+					if ((0xffffffff00000000LL&cur->slots[ARG0])&&(0xffffffff00000000LL&cur->slots[1 + ARG0])) { \
+						cur->slots[ARG0]=( unbox<double>(cur->slots[ARG0]) EOP unbox<double>(cur->slots[1 + ARG0]) )?V_TRUE:V_FALSE; \
 					} else { \
-						do_cmp(cur->slots,eop>>8,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
-					} continue;
+						do_cmp(cur->slots,ARG0,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
+					}
 				case OPC::LT:
 					NANOES__RUNTIME__RUNBLOCK__CMP(<, throw std::runtime_error("Cannot < compare a bool");)
+					continue;
 				case OPC::LEQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(<=, throw std::runtime_error("Cannot <= compare a bool");)
+					continue;
 				case OPC::GEQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(>=, throw std::runtime_error("Cannot >= compare a bool");)
+					continue;
 				case OPC::GT:
 					NANOES__RUNTIME__RUNBLOCK__CMP(>, throw std::runtime_error("Cannot > compare a bool");)
+					continue;
 				case OPC::EQ :
 					NANOES__RUNTIME__RUNBLOCK__CMP(==, return a==b;)
+					continue;
 				case OPC::NEQ :
 					NANOES__RUNTIME__RUNBLOCK__CMP(!= , return a != b;)
+					continue;
 				case OPC::ADD: {
-					int off = eop >> 8;
-					if ((0xffffffff00000000LL & cur->slots[off]) && (0xffffffff00000000LL & cur->slots[1 + off])) {
+					if ((0xffffffff00000000LL & cur->slots[ARG0]) && (0xffffffff00000000LL & cur->slots[1 + ARG0])) {
 						goto op_add_double;
 					}
-					valuebase *lp = to_ptr(cur->slots[off]);
-					valuebase *rp = to_ptr(cur->slots[off+1]);
+					valuebase *lp = to_ptr(cur->slots[ARG0]);
+					valuebase *rp = to_ptr(cur->slots[ARG0+1]);
 					std::string * ls = lp?lp->get<std::string>():nullptr, *rs = rp?rp->get<std::string>():nullptr;
 					if (ls || rs) {
-						std::string sl = unbox<std::string>(cur->slots[off]), sv = unbox<std::string>(cur->slots[off+1]);
+						std::string sl = unbox<std::string>(cur->slots[ARG0]), sv = unbox<std::string>(cur->slots[ARG0+1]);
 						std::string out = sl + sv;
-						cur->slots[off] = box<std::string>(std::move(out));
+						cur->slots[ARG0] = box<std::string>(std::move(out));
 					} else {
 					op_add_double:
-						double dlv = unbox<double>(cur->slots[off]), drv = unbox<double>(cur->slots[off+1]);
-						cur->slots[off] = box(dlv + drv);
+						double dlv = unbox<double>(cur->slots[ARG0]), drv = unbox<double>(cur->slots[ARG0+1]);
+						cur->slots[ARG0] = box(dlv + drv);
 					}
 					continue;
 				}
@@ -1279,34 +1283,24 @@ namespace nanoes {
 					ctx.cgmem[if_fail_key] = ctx.label();
 				}
 				return 1;
-			//} else if (T_WHILE == tt) {
-			//	lexeat(ctx);
-			//	if (LPAR != lexpeek(ctx))
-			//		throw std::runtime_error("expected ( after while but found " + tok);
-			//	auto cond = expr(tt, ctx, 0);
-			//	// right parenthesis will have been parsed as part of the expression!
-			//	std::vector<OP> wcode;
-			//	stmt(wcode, ctx, fnLvl + 1);
-			//	int tsize = 1 + std::max(tsize_op(cond), tsize_block(wcode));
-			//	seq.push_back(ctx.add_op(tsize, [this, cond = std::move(cond), wcode = std::move(wcode)](scope **scope, int roff) {
-			//		scope::scares tmp(scope, 1);
-			//		while (true) {
-			//			cond->invoke(scope, tmp.off);
-			//			if (!truthy(tmp[0]))
-			//				break;
-			//			STATUS code = runblock(scope, roff, wcode);
-			//			// TODO: labels
-			//			if (code == STATUS::OK || code == STATUS::CONTINUE)
-			//				continue;
-			//			else if (code == STATUS::BREAK)
-			//				break;
-			//			else if (code == STATUS::RETURN)
-			//				return STATUS::RETURN;
-			//			else abort();
-			//		}
-			//		return STATUS::OK;
-			//	}));
-			//	return 1;
+			} else if (T_WHILE == tt) {
+				void* while_stop_key = (void*)ctx.state; // use while token ptr as while_stop_key
+				lexeat(ctx);
+				if (LPAR != lexpeek(ctx))
+					throw std::runtime_error("expected ( after while but found " + tok);
+				int retrypos = ctx.label();
+				auto cond = expr(tt, ctx, 0);
+				// right parenthesis will have been parsed as part of the expression!
+				ctx.add(OPC::FGOTO, cond->off, ctx.cgmem[while_stop_key], true);
+				cond.reset();
+				// do body
+				// TODO: support continue/break
+				stmt(ctx, fnLvl + 1);
+				// and goto start
+				ctx.add(OPC::GOTO, 0, retrypos, true);
+				// we should land here if the while cond fails
+				ctx.cgmem[while_stop_key] = ctx.label();
+				return 1;
 			}
 			auto op = expr(tt, ctx, 0);
 			if (SEMICOLON != lexeat(ctx))

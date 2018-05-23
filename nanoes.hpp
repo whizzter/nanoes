@@ -58,8 +58,12 @@ namespace nanoes {
 	// If the high 32bits are clear then we have an object reference
 	// where the lowest bit is a semi-space index and the rest is an offset into that space.
 	// otherwise the 64bit number is an double that gets it's value by XOR:ing the specific NAN pattern.
-	typedef int64_t VAL;
-	static constexpr const int64_t NUNPAT = 0xfffff00f00000000LL;
+//	typedef int64_t VAL;
+//	static constexpr const int64_t NUNPAT = 0xfffff00f00000000LL;
+	union VAL {
+		uint64_t uval;
+		double dval;
+	};
 
 	class nesvalue {
 		friend class runtime;
@@ -79,7 +83,9 @@ namespace nanoes {
 			prev->next = this;
 			next->prev = this;
 		}
-		nesvalue(runtime *in_rt) : prev(this), next(this), rt(in_rt), value(NUNPAT) {}
+		nesvalue(runtime *in_rt) : prev(this), next(this), rt(in_rt) {
+			value.uval = 0;
+		}
 	public:
 		nesvalue(const nesvalue& other) : rt(other.rt),value(other.value) {
 			link(const_cast<nesvalue&>(other));
@@ -305,11 +311,6 @@ namespace nanoes {
 			return rv;
 		}
 
-		// helper union for boxing/unboxing
-		union VBOX {
-			int64_t i64v;
-			double dval;
-		};
 
 		class gcbase;
 		//typedef std::function<void(VAL*, gcbase**)> toucher;
@@ -350,10 +351,10 @@ namespace nanoes {
 		};
 
 		inline valuebase* to_ptr(VAL v) {
-			if (v & 0xffffffff00000000LL) {
+			if (v.uval < (uint64_t)0xffffffff00000000LL) {
 				return 0;
 			} else {
-				int32_t i = (int32_t)v;
+				uint32_t i = (uint32_t)v.uval;
 				return (valuebase*)(hptr[i & 1] + i);
 			}
 		}
@@ -379,10 +380,8 @@ namespace nanoes {
 		}
 		template<>
 		inline double unbox<double>(VAL v) {
-			if (v & 0xffffffff00000000LL) {
-				VBOX box;
-				box.i64v = v^NUNPAT;
-				return box.dval;
+			if (v.uval < (uint64_t)0xffffffff00000000LL) {
+				return v.dval;
 			} else {
 				return to_ptr(v)->to_num();
 			}
@@ -404,14 +403,14 @@ namespace nanoes {
 			if (valuebase *p = to_ptr(fn)) {
 				return p->invoke(*this, arg, args);
 			} else {
-				throw std::runtime_error(std::string("number ") + std::to_string(fn >> 1) + " is not a function");
+				throw std::runtime_error(std::string("number ") + std::to_string(fn.dval) + " is not a function");
 			}
 		}
 
 		inline bool truthy(VAL v) {
-			if (v == V_TRUE) return true;
-			if (v == V_FALSE) return false;
-			if (v == V_NULL) return false;
+			if (v.uval == V_TRUE.uval) return true;
+			if (v.uval == V_FALSE.uval) return false;
+			if (v.uval == V_NULL.uval) return false;
 			if (valuebase *p = to_ptr(v)) {
 				return p->truthy();
 			} else {
@@ -425,7 +424,8 @@ namespace nanoes {
 		struct scopeinfo {
 			std::shared_ptr<scopeinfo> parent = nullptr;
 			std::vector<std::pair<int, std::string>> names;
-			size_t max=0;
+			size_t maxnames=0;
+			size_t maxstack = 0;
 			bool local = true; // does variables in this scope escape? in that case we always need to allocate these scopes on the heap!
 		};
 
@@ -433,7 +433,7 @@ namespace nanoes {
 
 		struct scope : public gcbase {
 			virtual size_t size() {
-				return (size_t)(((VAL*)alignafter(align(), (void*)sizeof(*this))) + info->max);
+				return (size_t)(((VAL*)alignafter(align(), (void*)sizeof(*this))) + info->maxnames);
 			}
 			size_t runtime::scope::align()
 			{
@@ -442,26 +442,26 @@ namespace nanoes {
 			virtual void moveto(void* dest) {
 				scope * out = (scope*)dest;
 				VAL* slots = (VAL*)alignafter(align(), out);
-				memcpy(slots, this->slots, info->max);
+				memcpy(slots, this->nslots, info->maxnames);
 				::new (out) scope(slots, info);
 			}
 			virtual void touch(toucher& to) {
 				to.touch(parent);
-				int max = info->max;
+				int max = info->maxnames;
 				for (int i = 0;i < max;i++)
-					to.touch(slots[i]);
+					to.touch(nslots[i]);
 			}
 
 			scope * parent = nullptr;
 
 			scopeinfo *info;
 
-			VAL* slots;
+			VAL* nslots;
 
-			scope(VAL* islots, scopeinfo *in_info) : slots(islots), info(in_info) {
+			scope(VAL* islots, scopeinfo *in_info) : nslots(islots), info(in_info) {
 				if (islots)
-					for (size_t i = 0;i < in_info->max;i++)
-						islots[i] = NUNPAT; // nunpat flips to zero
+					for (size_t i = 0;i < in_info->maxnames;i++)
+						islots[i].uval = 0; // nunpat flips to zero
 			}
 		};
 	
@@ -471,9 +471,12 @@ namespace nanoes {
 			runtime *rt;
 			frame *prev;
 			scope** mscope;
-			// TODO: move stack here?
-			frame(runtime *in_rt, scope** in_scope) : mscope(in_scope), rt(in_rt), prev(rt->activeframe) {
+			int ssize;
+			VAL* stack;
+			frame(runtime *in_rt, scope** in_scope,int issize,VAL* istack) : mscope(in_scope), rt(in_rt), prev(rt->activeframe),ssize(issize),stack(istack) {
 				rt->activeframe = this;
+				for (int i = 0;i < issize;i++)
+					stack[i].uval = 0;
 			}
 			~frame() {
 				assert(rt->activeframe == this);
@@ -555,9 +558,12 @@ namespace nanoes {
 				touch(croot->value);
 				croot = croot->next;
 			} while (croot != &uroot);
-			// mark the active stack frames.
+			// mark the active stack frames and associated scopes.
 			frame *t = activeframe;
 			while (t) {
+				for (int i = 0;i < t->ssize;i++) {
+					touch(t->stack[i] );
+				}
 				scope* s = *t->mscope;
 				if (s->info->local) { // local scope, only touch the currently active stack entries.
 					s->touch(*this);  // delegate touching to the scope-obj itself
@@ -681,7 +687,9 @@ namespace nanoes {
 			if (dist >= heap[aHeap].sz) {
 				abort(); // TODO: fix so that the ptr_to_val macro can detect ptrs from the other heap (although that should never be done/used!)
 			}
-			return dist | aHeap;
+			VAL out;
+			out.uval = 0xffffffff00000000LL | ( dist|aHeap );
+			return out;
 		}
 
 
@@ -713,15 +721,15 @@ namespace nanoes {
 		}
 
 		inline VAL box(double v) {
-			VBOX vb;
+			VAL vb;
 			vb.dval = v;
-			auto out = vb.i64v^NUNPAT;
-			if (out& 0xffffffff00000000LL) {
+			if (vb.uval < 0xffffffff00000000LL) {
 				// if the pattern ok then return it
-				return out;
+				return vb;
 			} else {
 				// we had a NaN pattern that collided with our nunmask, return another nan
-				return 0xfff8000000000000LL ^ NUNPAT;
+				vb.uval &= 0xfffff8ff00000000LL;
+				return vb;
 			}
 		}
 		VAL box(int v) {
@@ -730,25 +738,30 @@ namespace nanoes {
 
 		enum class OPC : uint8_t {
 			URETURN=0,
-			RETURN,
-			LOADINT,      // 2 value : next 12 is target-slot
-			LOADDOUBLE,   // 3 values, 12 bits of target slot, 2 following values that are low/high bits
-			LOADLIT,      // 1 value : 8bits op, 12bit target, ????
-			LOADGLOB,     // 2 values :8bits op, 12bits target, 64bit ptr (only low 32bit loaded on 32bit arch)
-			LOADNULL,     // 1 value  : 8bits op, 12bits target
-			LOADTRUE,
-			LOADFALSE,
-			MOV,          // 2 values :8bits op, 12bits target, 12bits: next 12bits up (ignore masking initially!)
-			INVOKE,       // 1 value : 8bit ops, 12bits base, 12 bits count
-			ADD, SUB, MUL, DIV, MOD, // pops 2 and computes something. (8bit op, 12bit target, 12bit other)
+			RETURN=1,
+			LOADINT=2,      // 2 value : next 8 is target-slot
+			LOADDOUBLE=3,   // 3 values, 8 bits of target slot, 2 following values that are low/high bits
+			LOADLIT=4,      // 1 value : 8bits op, 8 target, ????
+			LOADGLOBAL=5,     // 2 values :8bits op, 8 target, 16bit target idx
+			LOADNULL=6,     // 1 value  : 8bits op, 8 target
+			LOADTRUE=7,
+			LOADFALSE=8,
+			LOADSSYM=9,       // 2 values :8bits op, 8bits target, 10 bits sym-idx and 6 bit up-count
+			INVOKE=0xa,       // 1 value : 8bit ops, 8bits base, 16 bits count
+			// 0xb-0xf
+			ADD, SUB, MUL, DIV, MOD, // pops 2 and computes something. (8bit op, 8bit target)
+			// 0x10-0x15
 			LT, LEQ, GEQ, GT, EQ, NEQ,
-			FGOTO,        // 1 value : 8bit op, 12bit slot, 12bit jump offset
-			GOTO          // 1 value : 8bit op, 12bit ????, 12bit jump offset
+			// 0x16
+			FGOTO,        // 1 value : 8bit op, 8bit slot, 16bit jump offset
+			// 0x17
+			GOTO          // 1 value : 8bit op, 8bit ????, 16bit jump offset
 		};
 
 		struct fungenctx {
 			std::vector<int32_t> code;
 			std::vector<nesvalue> literals;
+			std::vector<int> globals;
 			size_t sp = 0;
 		};
 
@@ -760,11 +773,16 @@ namespace nanoes {
 			int argcount;
 			std::vector<int32_t> code;
 			std::vector<nesvalue> literals;
+			std::vector<VAL*> globals;
 			std::string src;
 		public:
 			funtpl(runtime *in_rt, std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, fungenctx & in_gctx,std::string&& insrc)
 				: rt(in_rt), id(in_id), argcount(in_argcount), info(in_si),code(std::move(in_gctx.code)),literals(in_gctx.literals),src(insrc)
-			{}
+			{
+				for (auto id : in_gctx.globals) {
+					globals.push_back(&rt->global[id]);
+				}
+			}
 		};
 		struct funinst : valuebase {
 			std::shared_ptr<funtpl> code;
@@ -815,36 +833,29 @@ namespace nanoes {
 			std::map<void*, int> cgmem;
 			fungenctx * gctx;
 
-			void add(int32_t v) {
-				gctx->code.push_back(v);
-			}
-			void add(int64_t v) {
-				add(int32_t(v));
-				add(int32_t(v >> 32));
-			}
-			void addglob(const std::string& tok) {
-				int id = rt->atok(tok.c_str());
-				if (sizeof(int64_t) == sizeof(void*)) {
-					int64_t addr = (int64_t)&(rt->global[id]);
-					add(addr);
-				} else if (sizeof(int32_t) == sizeof(void*)) {
-					int32_t addr = (int32_t)&(rt->global[id]);
-					add(addr);
-				} else abort();
-			}
 			int addlit(const std::string& v) {
 				int lid = gctx->literals.size();
 				gctx->literals.emplace_back(rt->uroot);
 				gctx->literals[lid].value = rt->box<std::string>(std::string(v));
 				return lid;
 			}
-			void add(OPC a,int32_t b=0,int32_t c=0,bool reladdr=false) {
+			void add(OPC a,int32_t b=0,int32_t c=0,bool reladdr=false,double *dvp=nullptr) {
 				if (reladdr) {
+					//printf("Goto label %d from %d\n",c,gctx->code.size());
 					c -= gctx->code.size() + 1;
+				} else {
+					//printf("Op %d at %d\n", a, gctx->code.size());
 				}
-				add(((int)a) | (b << 8) | (c << 20));
+				int32_t v=(((int)a) | (b << 8) | (c << 16));
+				gctx->code.push_back(v);
+				if (dvp) {
+					VAL v = rt->box(*dvp);
+					gctx->code.push_back(int32_t(v.uval));
+					gctx->code.push_back(int32_t(v.uval>>32));
+				}
 			}
 			int label() {
+				//printf("Label at %d\n", gctx->code.size());
 				return gctx->code.size();
 			}
 
@@ -855,7 +866,7 @@ namespace nanoes {
 				spres(parsectx &ictx, int x) : ctx(&ictx), off(ctx->gctx->sp), sz(x) {
 					ctx->gctx->sp += sz;
 					scopeinfo * ascope = ctx->curscope ? ctx->curscope.get() : ctx->topscope.get();
-					ascope->max = std::max(ctx->gctx->sp, ascope->max);
+					ascope->maxstack = std::max(ctx->gctx->sp, ascope->maxstack);
 
 				}
 				~spres() {
@@ -889,7 +900,7 @@ namespace nanoes {
 					if (loc != from->names.end()) {
 						if (count)
 							from->local = false; // not a local access, taint it!
-						return std::make_pair(count, loc - from->names.begin());
+						return std::make_pair(count, int(loc - from->names.begin()));
 					}
 					if (scopeinfo * parent = from->parent.get()) {
 						auto up = access(tok, parent, count + 1);
@@ -944,8 +955,6 @@ namespace nanoes {
 			} else if (statement)
 				throw std::runtime_error("expected function name but found " + tok);
 
-			// store a key for our namecount 
-			void * namecountkey = (void*)ctx.state;
 			// next ensure we have parens for the argument list
 			if (LPAR != lexeat(ctx))
 				throw std::runtime_error("expected ( after function name but found " + tok);
@@ -970,10 +979,10 @@ namespace nanoes {
 			// store some previous state.
 			fungenctx *ogctx= ctx.gctx;
 			// now setup things for our context.
+			printf(" ---- Begin fun....\n");
 			fungenctx gctx;
 			ctx.gctx = &gctx;
-			gctx.sp = ctx.prep ? 0 : ctx.cgmem[namecountkey];
-			argscope->max = gctx.sp;
+			argscope->maxstack = gctx.sp = 0;
 
 			// check for a brace (the brace-pair will be parsed by the stmt parsing function)
 			if (LBRA != lexpeek(ctx))
@@ -987,12 +996,11 @@ namespace nanoes {
 			// restore previous state
 			ctx.gctx = ogctx;
 
-			// memorize the number of names so we can calculate accurate stack positions next time.
-			if (ctx.prep)
-				ctx.cgmem[namecountkey] = argscope->names.size();
+			argscope->maxnames = argscope->names.size();
 
 			ctx.leave_scope();
-			return std::make_shared<funtpl>(this,id, argcount, argscope, gctx,std::string(srcstart,ctx.state));
+			printf(" ---- End fun....\n");
+			return ctx.prep?nullptr:std::make_shared<funtpl>(this,id, argcount, argscope, gctx,std::string(srcstart,ctx.state));
 		}
 		std::unique_ptr<parsectx::spres> expr(int & tt, parsectx & ctx, int prec) {
 			std::string & tok = ctx.tok;
@@ -1011,19 +1019,20 @@ namespace nanoes {
 			};
 			if (tt >= USER) {
 				auto info = ctx.access(tt);
+				// These instructions will be different between passes.. they cannot be differently sized!
 				if (info.first == -1) {
-					ctx.add(OPC::LOADGLOB, stack->off);
-					ctx.addglob(ctx.tok);
+					size_t idx=std::distance(ctx.gctx->globals.begin(),std::find(ctx.gctx->globals.begin(), ctx.gctx->globals.end(), tt));
+					if (idx == ctx.gctx->globals.size())
+						ctx.gctx->globals.push_back(tt);
+					ctx.add(OPC::LOADGLOBAL, stack->off,idx);
 				} else {
-					ctx.add(OPC::MOV,stack->off,info.second);
-					ctx.add(info.first); // up stored
+					ctx.add(OPC::LOADSSYM,stack->off,(info.second)|(info.first<<10));
 				}
 			} else if (STR == tt) {
 				ctx.add(OPC::LOADLIT, stack->off,ctx.addlit(tok)); // TODO: do value index..
 				//ctx.add(box<double>(dnum));
 			} else if (tt == DNUM) {
-				ctx.add(OPC::LOADDOUBLE, stack->off);
-				ctx.add(box(dnum));
+				ctx.add(OPC::LOADDOUBLE, stack->off,0,false,&dnum);
 			} else if (tt == LPAR) {
 				stack.reset();
 				stack=expr(tt, ctx, 0);
@@ -1120,7 +1129,7 @@ namespace nanoes {
 				auto fn = parse_fun(ctx, true);
 				if (ctx.curscope) {
 					abort();
-				} else {
+				} else if (!ctx.prep) {
 					// we're at the toplevel eval, just box the fun-value directly!
 					VAL v = box(std::move(funinst(nullptr, fn)));
 					// we assign separately since we don't want bogus ptr slots in the map
@@ -1143,8 +1152,8 @@ namespace nanoes {
 				return 1;
 			} else if (T_IF == tt) {
 				// we need 2 gotos... IF fail target (else or end), tcode-end-target (post else or directly after?)
-				void* if_fail_key = (void*)ctx.state; // use if token ptr as if_fail_key
 				lexeat(ctx);
+				void* if_fail_key = (void*)ctx.state; // use left paren token ptr as if_fail_key
 				if (LPAR != lexpeek(ctx))
 					throw std::runtime_error("expected ( after if but found " + tok);
 				auto condslot = expr(tt, ctx, 0);
@@ -1153,8 +1162,9 @@ namespace nanoes {
 				// data in slot consumed!
 				condslot.reset();
 				stmt(ctx, fnLvl + 1);
-				if (T_ELSE == lexpeek(ctx, T_ELSE)) {
+				if (T_ELSE == lexpeek(ctx)) {
 					void* fcode_end_key = (void*)ctx.state; // use left paren token ptr as tcode_end_key
+					lexeat(ctx);
 					ctx.add(OPC::GOTO, 0, ctx.cgmem[fcode_end_key], true);
 					ctx.cgmem[if_fail_key] = ctx.label();
 					int rbr = stmt(ctx, fnLvl + 1);
@@ -1199,6 +1209,7 @@ namespace nanoes {
 			{
 				// eval runs the parser twice to build a scope chain during the first pass.
 				parsectx ctx(this);
+				printf("---- Start of pass 1----------\n");
 				ctx.rt = this;
 				ctx.state = script.c_str();
 				ctx.topscope = std::make_shared<scopeinfo>();
@@ -1208,12 +1219,14 @@ namespace nanoes {
 				// run first pass of the parser.
 				while (-1 != stmt(ctx, 0)) {}
 
+				printf("---- End of pass 1----------\n");
 				assert(gctx.sp == 0);
 				assert(!ctx.curscope);
 				// reset some things before the second iteration of the parser.
 				ctx.prep = false;           // turn off the prep-flag, this will cause memory to be allocated generated.
 				gctx.code.clear();                // reset the top code vector.
 				gctx.literals.clear();       // remove the literals to re-gen them
+				gctx.globals.clear();
 				ctx.state = script.c_str(); // reset the parser ptr
 				ctx.tok.clear();            // clear the parsing token
 				ctx.curscope = nullptr;     // and ensure that we are at the toplevel scope (should not be unless there is parser bugs)
@@ -1254,7 +1267,7 @@ namespace nanoes {
 		auto ftpl=fi->qp;
 		// create local scope if the functions scope is local.
 		bool is_local = ftpl->info->local;
-		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*ftpl->info->max) : nullptr;
+		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*ftpl->info->maxnames) : nullptr;
 		scope local(is_local?localdata:nullptr, ftpl->info.get());
 		scope * cur = &local;
 		if (!is_local) {
@@ -1263,29 +1276,32 @@ namespace nanoes {
 		// TODO: varargs
 		int copyargs = std::min(argc, ftpl->argcount);
 		for (int i = 0;i < copyargs;i++) {
-			cur->slots[i] = args[i];
+			cur->nslots[i] = args[i];
 		}
 		//	return rt.runblock(qp,fnscope, this->code->code.data());
 		{
 			auto ops = ftpl->code.data();
-			frame cframe(rt, &cur);
-			VAL rv = NUNPAT;
+			int mstack = ftpl->info->maxstack;
+			VAL* stack = (VAL*)alloca(sizeof(VAL)*mstack);
+			frame cframe(rt, &cur,mstack, stack);
+			VAL rv;
+			rv.uval = 0;
 			while (true) {
 				int eop = *ops++;
 				OPC op;
-				int ARG0 = (eop >> 8) & 0xfff;
-				int ARG1 = (eop >> 20);
+				int ARG0 = (eop >> 8) & 0xff;
+				int ARG1 = (eop >> 16);
 				switch (op = OPC(eop & 0xff)) {
 				case OPC::URETURN: {
 					rv = rt->V_NULL;
 					goto eofun;
 				}
 				case OPC::RETURN: {
-					rv = cur->slots[ARG0];
+					rv = stack[ARG0];
 					goto eofun;
 				}
 				case OPC::FGOTO: {
-					if (!rt->truthy(cur->slots[ARG0])) {
+					if (!rt->truthy(stack[ARG0])) {
 						ops += ARG1;
 					}
 					continue;
@@ -1295,93 +1311,89 @@ namespace nanoes {
 					continue;
 				}
 				case OPC::LOADNULL: {
-					cur->slots[ARG0] = rt->V_NULL;
+					stack[ARG0] = rt->V_NULL;
 					continue;
 				}
 				case OPC::INVOKE: {
-					auto val = rt->invoke(cur->slots[ARG0], ARG1, cur->slots + ARG0 + 1);
-					cur->slots[ARG0] = val;
+					auto val = rt->invoke(stack[ARG0], ARG1, stack + ARG0 + 1);
+					stack[ARG0] = val;
 					continue;
 				}
 				case OPC::LOADDOUBLE: {
-					cur->slots[ARG0] = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
+					stack[ARG0].uval = (((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
 					ops += 2;
 					continue;
 				}
-				case OPC::LOADGLOB: {
-					if (sizeof(int64_t) == sizeof(void*)) {
-						VAL* p = (VAL*)(((uint32_t)ops[0]) | (((int64_t)ops[1]) << 32));
-						ops += 2;
-						cur->slots[ARG0] = *p;
-					} else if (sizeof(int32_t) == sizeof(void*)) {
-						VAL* p = (VAL*)*ops++;
-						cur->slots[ARG0] = *p;
-					} else abort();
+				case OPC::LOADGLOBAL: {
+					VAL* p = ftpl->globals[ARG1];
+					stack[ARG0] = *p;
 					continue;
 				}
-				case OPC::MOV: {
+				case OPC::LOADSSYM: {
 					scope* fs = cur;
-					int up = *ops++;
+					int up = ARG1>>10;
 					while (up--) {
 						fs = fs->parent;
 					}
-					cur->slots[ARG0] = fs->slots[ARG1];
+					stack[ARG0] = fs->nslots[ARG1&0x3ff];
 					continue;
 				}
 				case OPC::LOADLIT:
-					cur->slots[ARG0] = ftpl->literals[ARG1].value;
+					stack[ARG0] = ftpl->literals[ARG1].value;
 					continue;
 				case OPC::SUB:
-					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) - rt->unbox<double>(cur->slots[1 + ARG0]));
+					stack[ARG0] = rt->box(stack[ARG0].dval - stack[1 + ARG0].dval);
 					continue;
 				case OPC::MUL:
-					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) * rt->unbox<double>(cur->slots[1 + ARG0]));
+					stack[ARG0] = rt->box(stack[ARG0].dval * stack[1 + ARG0].dval);
 					continue;
 				case OPC::DIV:
-					cur->slots[ARG0] = rt->box(rt->unbox<double>(cur->slots[ARG0]) / rt->unbox<double>(cur->slots[1 + ARG0]));
+					stack[ARG0] = rt->box(rt->unbox<double>(stack[ARG0]) / rt->unbox<double>(stack[1 + ARG0]));
 					continue;
 				case OPC::MOD:
-					cur->slots[ARG0] = rt->box(std::fmod(rt->unbox<double>(cur->slots[ARG0]), rt->unbox<double>(cur->slots[1 + ARG0])));
+					stack[ARG0] = rt->box(std::fmod(rt->unbox<double>(stack[ARG0]), rt->unbox<double>(stack[1 + ARG0])));
 					continue;
 #define NANOES__RUNTIME__RUNBLOCK__CMP(EOP,ROP) \
-					if ((0xffffffff00000000LL&cur->slots[ARG0])&&(0xffffffff00000000LL&cur->slots[1 + ARG0])) { \
-						cur->slots[ARG0]=( rt->unbox<double>(cur->slots[ARG0]) EOP rt->unbox<double>(cur->slots[1 + ARG0]) )?rt->V_TRUE:rt->V_FALSE; \
+					if (stack[ARG0].uval<0xffffffff00000000LL&&stack[1 + ARG0].uval<0xffffffff00000000LL ) { \
+						stack[ARG0]=( stack[ARG0].dval EOP stack[1 + ARG0].dval )?rt->V_TRUE:rt->V_FALSE; \
 					} else { \
-						rt->do_cmp(cur->slots,ARG0,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
+						rt->do_cmp(stack,ARG0,[](auto& a, auto& b) { return a EOP b; }, [](const auto& a, const auto& b)->bool { ROP }); \
 					}
 				case OPC::LT:
 					NANOES__RUNTIME__RUNBLOCK__CMP(<, throw std::runtime_error("Cannot < compare a bool");)
-						continue;
+					continue;
 				case OPC::LEQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(<= , throw std::runtime_error("Cannot <= compare a bool");)
-						continue;
+					continue;
 				case OPC::GEQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(>= , throw std::runtime_error("Cannot >= compare a bool");)
-						continue;
+					continue;
 				case OPC::GT:
 					NANOES__RUNTIME__RUNBLOCK__CMP(>, throw std::runtime_error("Cannot > compare a bool");)
-						continue;
+					continue;
 				case OPC::EQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(== , return a == b;)
-						continue;
+					continue;
 				case OPC::NEQ:
 					NANOES__RUNTIME__RUNBLOCK__CMP(!= , return a != b;)
-						continue;
+					continue;
 				case OPC::ADD: {
-					if ((0xffffffff00000000LL & cur->slots[ARG0]) && (0xffffffff00000000LL & cur->slots[1 + ARG0])) {
-						goto op_add_double;
-					}
-					valuebase *lp = rt->to_ptr(cur->slots[ARG0]);
-					valuebase *rp = rt->to_ptr(cur->slots[ARG0 + 1]);
-					std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
-					if (ls || rs) {
-						std::string sl = rt->unbox<std::string>(cur->slots[ARG0]), sv = rt->unbox<std::string>(cur->slots[ARG0 + 1]);
-						std::string out = sl + sv;
-						cur->slots[ARG0] = rt->box<std::string>(std::move(out));
+					if ( (stack[ARG0].uval| stack[ARG0+1].uval)<(uint64_t)0xffffffff00000000LL) {
+						// fast-path if both numbers are far away from our NANTAG-pattern (should be majority of the time!)
+						double dlv = stack[ARG0].dval, drv = stack[ARG0 + 1].dval;
+						stack[ARG0] = rt->box(dlv + drv);
 					} else {
-					op_add_double:
-						double dlv = rt->unbox<double>(cur->slots[ARG0]), drv = rt->unbox<double>(cur->slots[ARG0 + 1]);
-						cur->slots[ARG0] = rt->box(dlv + drv);
+						valuebase *lp = rt->to_ptr(stack[ARG0]);
+						valuebase *rp = rt->to_ptr(stack[ARG0 + 1]);
+						std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
+						if (ls || rs) {
+							std::string sl = rt->unbox<std::string>(stack[ARG0]), sv = rt->unbox<std::string>(stack[ARG0 + 1]);
+							std::string out = sl + sv;
+							stack[ARG0] = rt->box<std::string>(std::move(out));
+						} else {
+							double dlv = stack[ARG0].dval, drv = stack[ARG0 + 1].dval;
+							stack[ARG0] = rt->box(dlv + drv);
+						}
 					}
 					continue;
 				}
@@ -1390,10 +1402,6 @@ namespace nanoes {
 				}
 			}
 		eofun:
-			// after returning we clear out the stack-values so we don't hold extra references. (make it exception safe?)
-			for (size_t i = cur->info->names.size();i < cur->info->max;i++) {
-				cur->slots[i] = NUNPAT;
-			}
 			return rv;
 		}
 	}

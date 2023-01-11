@@ -27,49 +27,54 @@
 #include <iostream>
 #endif
 
-// direct-TDOP-compiler.
-// problem 1: Symbols not visible? , enforce let or forbid var? problem when we need to late-discover!
-//            trick... we could have a rewind position and just re-parse the entire code until the newly discovered snippet?!
-//            ^- seems brilliant, could be a tad slow, could just make it 2-pass for function blocks (or per-script 2 pass with an initial pass of fun/binding recording)
-
 namespace nanoes {
 	class runtime;
+	// we predeclare the precompiled class and the precompiler itself.
+	class precompiled;
+	class precompiler;
 
+	// (see id template below) helper type identity templates used to do boxed type discovery
 	template<class T>
-	static intptr_t id_all() {
+	inline intptr_t id_all() {
 		static int id;
 		return intptr_t(&id);
 	}
+	// enforce specific id's for int/double
 	template<>
-	static intptr_t id_all<int>() {
+	inline intptr_t id_all<int>() {
 		return 1;
 	}
 	template<>
-	static intptr_t id_all<double>() {
+	inline intptr_t id_all<double>() {
 		return 2;
 	}
 
+	// ref/const removing identity template.
 	template<class T>
-	static intptr_t id() {
+	inline intptr_t id() {
 		return id_all<std::remove_const<std::remove_reference<T>::type>::type>();
 	}
 
-	// Values are stored as NUN tagged 64 bit ints
-	// If the high 32bits are clear then we have an object reference
+	// Values are stored as NAN tagged 64 bit ints
+	// a value with all the high 32bits set is considered a reference instead of a double
 	// where the lowest bit is a semi-space index and the rest is an offset into that space.
-	// otherwise the 64bit number is an double that gets it's value by XOR:ing the specific NAN pattern.
-//	typedef int64_t VAL;
-//	static constexpr const int64_t NUNPAT = 0xfffff00f00000000LL;
-	union VAL {
+	// Use a union to indicate to the C compiler that we might access the values in 2 different ways.
+	union INTERNALVALUE {
 		uint64_t uval;
 		double dval;
 	};
 
+	// nesvalue is a C++ root-reference that can be used from outside the runtime
 	class nesvalue {
+		// runtime pointer, used to identify what runtime the pointer belongs to.
 		friend class runtime;
+		friend class precompiled;
 		runtime *rt;
+		// prev-next links
 		nesvalue *prev,*next;
-		VAL value;
+		// the actual value
+		INTERNALVALUE value;
+		// regular linked list unlink/link functions
 		void unlink() {
 			if (prev) {
 				prev->next = next;
@@ -83,13 +88,16 @@ namespace nanoes {
 			prev->next = this;
 			next->prev = this;
 		}
+		// private constructor only used by the inital runtime pointer.
 		nesvalue(runtime *in_rt) : prev(this), next(this), rt(in_rt) {
 			value.uval = 0;
 		}
 	public:
+		// other refs may only be constructed from other root-refs
 		nesvalue(const nesvalue& other) : rt(other.rt),value(other.value) {
 			link(const_cast<nesvalue&>(other));
 		}
+		// the = operator connects root-refs to the right runtime.
 		nesvalue& operator=(const nesvalue& other) {
 			if (rt != other.rt) {
 				unlink();
@@ -106,12 +114,18 @@ namespace nanoes {
 	};
 
 	class runtime {
+		// with them predeclared we can also friend them.
+		friend class precompiled;
+		friend class precompiler;
+
+		// predeclare some classes used.
 		class gcbase;
 		class valuebase;
-
+		template<class RT,class GCTX,class FTPL>
 		struct parsectx;
 		struct opbase;
 
+		// the alignfter macro finds the first aligned pointer on or after the given one.
 		static inline void* alignafter(size_t align, void *ip) {
 			// find the next possible free position
 			uintptr_t p = (uintptr_t)ip;
@@ -120,7 +134,7 @@ namespace nanoes {
 			return (void*)p;
 		}
 
-		// represent semi-spaces with the space structure.
+		// represent each semi-space with the space structure.
 		struct space {
 			size_t sz = 0;
 			char * ptr=nullptr; // this is the real ptr, hptr is an ptr that might be offset a bit.
@@ -221,102 +235,12 @@ namespace nanoes {
 			std::sort(toks.begin(), toks.end(), [](auto a, auto b) {  return a.second < b.second; });
 		}
 
-		// this function indicates if the character is a valid symbol character
-		int sym(int x, bool first = true) { return x == '_' || (first ? isalpha(x) : isalnum(x)); }
-
-		// eat one token from the stream into the context
-		int lexeat(parsectx & ctx, double *ddest = nullptr) {
-			const char *& state = ctx.state;
-			// skip over spaces (TODO: update line numbers?)
-			while (std::isspace(*state)) state++;
-			// search our sorted token+ID list by narrowing
-			int rs = 0, re = toks.size() - 1;
-			for (size_t sz = 0;rs <= re;) {
-				// pre-token is smaller, go to next
-				if (toks[rs].second.size() != sz && (toks[rs].second.size()<sz || toks[rs].second.c_str()[sz] < state[sz])) {
-					rs++;
-					continue;
-				}
-				// post-token is larger, go to next
-				if (toks[re].second.size() != sz && (toks[re].second.size() < sz || toks[re].second.c_str()[sz] > state[sz])) {
-					re--;
-					continue;
-				}
-				// pre- and post- token are equal and we've found it. (also make sure we don't have an ID token and it continues!)
-				if (rs == re && sz == toks[rs].second.size() && !(sym(state[0]) && sym(state[sz], false))) {
-					ctx.tok.assign(state, sz);
-					state += sz;
-					return toks[rs].first;
-				}
-				// ok, we haven't found a token or needed to narrow our range to so add another character
-				sz++;
-			}
-			// ok not an known operator or identifier, so either we have a new identifier or some kind of literal like a string or number
-			ctx.tok.clear();
-			if (*state == '\"') {
-				// parse a strings
-				state++;
-				char c;
-				while ((c = *state) != '\"') {
-					if (!c)
-						return -1;
-					if (c == '\\') {
-						state++;
-						if (*state == 'n') c = '\n';
-						else if (*state == 'r') c = '\r';
-						else if (*state == 'b') c = '\b';
-						else if (*state == 't') c = '\t';
-						// TODO: more charcter escape codes. ?
-						else c = *state;
-					}
-					ctx.tok.push_back(c);
-					state++;
-				}
-				state++;
-				return STR;
-			} else if (isdigit(*state) || (*state == '-'&&isdigit(state[1]))) {
-				const char * start = state;
-				double num = 0;
-				double sign = *state == '-' ? -1 : 1;
-				if (sign < 0)
-					state++;
-				while (isdigit(*state)) {
-					num = (num * 10) + (*state - '0');
-					state++;
-				}
-				ctx.tok.assign(start, state - start);
-				if (ddest) {
-					*ddest = num*sign;
-				}
-				return DNUM;
-			} else if (sym(*state)) {
-				while (sym(*state, false))
-					ctx.tok.push_back(*state++);
-				int rv = atok(ctx.tok.c_str());
-				return rv;
-			} else if (*state == 0) {
-				ctx.tok = "<END OF FILE>";
-				return -1;
-			} else {
-				throw std::runtime_error(std::string("Error, unknown token at ") + state);
-			}
-		}
-
-		int lexpeek(parsectx & ctx, int eat = -1) {
-			const char* preState = ctx.state;
-			int rv = lexeat(ctx);
-			if (rv == eat && rv != -1)
-				return rv;
-			ctx.state = preState;
-			return rv;
-		}
 
 
 		class gcbase;
-		//typedef std::function<void(VAL*, gcbase**)> toucher;
 		typedef runtime toucher;
 
-		std::map<int, VAL> global;
+		std::map<int, INTERNALVALUE> global;
 
 		class gcbase {
 			friend runtime;
@@ -343,14 +267,22 @@ namespace nanoes {
 				else
 					return nullptr;
 			}
-			// basic operations: prop-ref
-			virtual VAL invoke(runtime &rt,int argc, VAL * args) = 0;
+			virtual INTERNALVALUE invoke(runtime &rt,int argc, INTERNALVALUE * args) = 0;
 			virtual std::string to_string() = 0;
 			virtual double to_num() = 0;
 			virtual bool truthy() = 0;
+
+			// basic operations: prop-ref?
+			// vtable? (we could need an vtable upgrade thing but would buy us a lot of speed?)
+			// - VT value read: { let off = obj->vt[PIDX]; v = off?*(obj+off):obj->getter(PN) }
+			// - VT value write { let off = obj->vt[PIDX]; off?(*(obj+off)=v):obj->setter(PN,v) }
+			// Faster C++ integration:
+			// - RPOCO2(-like?) auto-VT-gen
+			//  - plus side of being able to keep WebGL refs as shared_ptr's that auto-unwraps for the native calls.
+			// - manual possible?
 		};
 
-		inline valuebase* to_ptr(VAL v) {
+		inline valuebase* to_ptr(INTERNALVALUE v) {
 			if (v.uval < (uint64_t)0xffffffff00000000LL) {
 				return 0;
 			} else {
@@ -360,7 +292,7 @@ namespace nanoes {
 		}
 
 		template<class T>
-		inline T unbox(VAL v) {
+		inline T unbox(INTERNALVALUE v) {
 			if (valuebase *p = to_ptr(v)) {
 				if (p->ty() != id<T>()) {
 					throw std::runtime_error(std::string("Invalid type in value"));
@@ -371,7 +303,7 @@ namespace nanoes {
 			}
 		}
 		template<>
-		inline void* unbox<void*>(VAL v) {
+		inline void* unbox<void*>(INTERNALVALUE v) {
 			if (valuebase *p = to_ptr(v)) {
 				return p;
 			} else {
@@ -379,7 +311,7 @@ namespace nanoes {
 			}
 		}
 		template<>
-		inline double unbox<double>(VAL v) {
+		inline double unbox<double>(INTERNALVALUE v) {
 			if (v.uval < (uint64_t)0xffffffff00000000LL) {
 				return v.dval;
 			} else {
@@ -387,7 +319,7 @@ namespace nanoes {
 			}
 		}
 		template<>
-		inline std::string unbox<std::string>(VAL v) {
+		inline std::string unbox<std::string>(INTERNALVALUE v) {
 			if (valuebase *p = to_ptr(v)) {
 				return p->to_string(); // TODO: do we want to move to GC strings?
 			} else {
@@ -395,11 +327,11 @@ namespace nanoes {
 			}
 		}
 		template<>
-		inline int unbox<int>(VAL v) {
+		inline int unbox<int>(INTERNALVALUE v) {
 			return (int)unbox<double>(v);
 		}
 
-		inline VAL invoke(VAL fn, int arg, VAL* args) {
+		inline INTERNALVALUE invoke(INTERNALVALUE fn, int arg, INTERNALVALUE* args) {
 			if (valuebase *p = to_ptr(fn)) {
 				return p->invoke(*this, arg, args);
 			} else {
@@ -407,7 +339,7 @@ namespace nanoes {
 			}
 		}
 
-		inline bool truthy(VAL v) {
+		inline bool truthy(INTERNALVALUE v) {
 			if (v.uval == V_TRUE.uval) return true;
 			if (v.uval == V_FALSE.uval) return false;
 			if (v.uval == V_NULL.uval) return false;
@@ -422,6 +354,7 @@ namespace nanoes {
 		// mid-pass, find variable targets and mark scopes non-local.
 		// 2nd pass, just use scope-info to 
 		struct scopeinfo {
+			bool top = false;
 			std::shared_ptr<scopeinfo> parent = nullptr;
 			std::vector<std::pair<int, std::string>> names;
 			size_t maxnames=0;
@@ -433,15 +366,15 @@ namespace nanoes {
 
 		struct scope : public gcbase {
 			virtual size_t size() {
-				return (size_t)(((VAL*)alignafter(align(), (void*)sizeof(*this))) + info->maxnames);
+				return (size_t)(((INTERNALVALUE*)alignafter(align(), (void*)sizeof(*this))) + info->maxnames);
 			}
 			size_t runtime::scope::align()
 			{
-				return std::max(alignof(decltype(*this)), alignof(VAL));
+				return std::max(alignof(decltype(*this)), alignof(INTERNALVALUE));
 			}
 			virtual void moveto(void* dest) {
 				scope * out = (scope*)dest;
-				VAL* slots = (VAL*)alignafter(align(), out);
+				INTERNALVALUE* slots = (INTERNALVALUE*)alignafter(align(), out);
 				memcpy(slots, this->nslots, info->maxnames);
 				::new (out) scope(slots, info);
 			}
@@ -456,9 +389,9 @@ namespace nanoes {
 
 			scopeinfo *info;
 
-			VAL* nslots;
+			INTERNALVALUE* nslots;
 
-			scope(VAL* islots, scopeinfo *in_info) : nslots(islots), info(in_info) {
+			scope(INTERNALVALUE* islots, scopeinfo *in_info) : nslots(islots), info(in_info) {
 				if (islots)
 					for (size_t i = 0;i < in_info->maxnames;i++)
 						islots[i].uval = 0; // nunpat flips to zero
@@ -472,8 +405,8 @@ namespace nanoes {
 			frame *prev;
 			scope** mscope;
 			int ssize;
-			VAL* stack;
-			frame(runtime *in_rt, scope** in_scope,int issize,VAL* istack) : mscope(in_scope), rt(in_rt), prev(rt->activeframe),ssize(issize),stack(istack) {
+			INTERNALVALUE* stack;
+			frame(runtime *in_rt, scope** in_scope,int issize,INTERNALVALUE* istack) : mscope(in_scope), rt(in_rt), prev(rt->activeframe),ssize(issize),stack(istack) {
 				rt->activeframe = this;
 				for (int i = 0;i < issize;i++)
 					stack[i].uval = 0;
@@ -485,9 +418,9 @@ namespace nanoes {
 		};
 
 
-		VAL V_TRUE;  // TODO: set and collect
-		VAL V_FALSE; // TODO: set and collect
-		VAL V_NULL;  // TODO: set and collect
+		INTERNALVALUE V_TRUE;  // TODO: set and collect
+		INTERNALVALUE V_FALSE; // TODO: set and collect
+		INTERNALVALUE V_NULL;  // TODO: set and collect
 		nesvalue uroot{ this };
 
 		template<class T>
@@ -530,7 +463,7 @@ namespace nanoes {
 			std::cout << "was moved to " << (void*)v << std::endl;
 #endif
 		}
-		void touch(VAL& vr,bool allownew=false) {
+		void touch(INTERNALVALUE& vr,bool allownew=false) {
 			// only need to work on pointers, so change to a pointer and then rebase it..
 			if (auto *p = to_ptr(vr)) {
 				touch(p,allownew);
@@ -604,11 +537,11 @@ namespace nanoes {
 			}
 			
 			template<class R, class ... ARGS, size_t... Is>
-			VAL invoke_impl(runtime &rt, std::function<R(ARGS...)> & data, int argc, VAL * args, std::index_sequence<Is...>) {
+			INTERNALVALUE invoke_impl(runtime &rt, std::function<R(ARGS...)> & data, int argc, INTERNALVALUE * args, std::index_sequence<Is...>) {
 				return rt.box(  data(   rt.unbox<ARGS>( args[Is] )...  ));
 			}
 			template<class R, class ... ARGS>
-			VAL invoke(runtime &rt, std::function<R(ARGS...)> & data, int argc, VAL * args) {
+			INTERNALVALUE invoke(runtime &rt, std::function<R(ARGS...)> & data, int argc, INTERNALVALUE * args) {
 				if (argc != sizeof...(ARGS)) {
 					// TODO: location
 					throw std::exception("Wrong script function arity");
@@ -616,7 +549,7 @@ namespace nanoes {
 				return invoke_impl(rt,data, argc, args, std::make_index_sequence<sizeof...(ARGS)>{});
 			}
 			template<class T>
-			VAL invoke(runtime &rt, T& ,int argc, VAL * args) {
+			INTERNALVALUE invoke(runtime &rt, T& ,int argc, INTERNALVALUE * args) {
 				throw std::runtime_error(std::string("Trying to invoke on a ")+typeid(T).name());
 			}
 
@@ -667,7 +600,7 @@ namespace nanoes {
 #endif
 				::new(dest) value(std::move(*this));
 			}
-			virtual VAL invoke(runtime &rt,int argc, VAL * args) {
+			virtual INTERNALVALUE invoke(runtime &rt,int argc, INTERNALVALUE * args) {
 				return invoke(rt,data, argc, args);
 			}
 			virtual double to_num() {
@@ -681,20 +614,30 @@ namespace nanoes {
 			}
 		};
 
-		VAL ptr_to_val(void *p) {
+		struct prop_slot {
+			INTERNALVALUE prop;
+			INTERNALVALUE value;
+		};
+		template<int I>
+		class dynobj : public valuebase {
+			std::unique_ptr<std::vector<prop_slot>> extras;
+		};
+
+
+		INTERNALVALUE ptr_to_val(void *p) {
 			uintptr_t ip = (uintptr_t)p;
 			auto dist = ip - ((uintptr_t)hptr[aHeap]);
 			if (dist >= heap[aHeap].sz) {
 				abort(); // TODO: fix so that the ptr_to_val macro can detect ptrs from the other heap (although that should never be done/used!)
 			}
-			VAL out;
+			INTERNALVALUE out;
 			out.uval = 0xffffffff00000000LL | ( dist|aHeap );
 			return out;
 		}
 
 
 		template<class T>
-		inline typename std::enable_if< std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv) {
+		inline typename std::enable_if< std::is_base_of<valuebase, T>::value, INTERNALVALUE>::type box(T && iv) {
 			T *p = heap[aHeap].findfree<T>();
 			if (!p) {
 				collect();
@@ -716,23 +659,24 @@ namespace nanoes {
 			return ptr_to_val(p);
 		}
 		template<class T>
-		inline typename std::enable_if< !std::is_base_of<valuebase, T>::value, VAL>::type box(T && iv) {
+		inline typename std::enable_if< !std::is_base_of<valuebase, T>::value, INTERNALVALUE>::type box(T && iv) {
 			return box(value<T>(std::move(iv)));
 		}
 
-		inline VAL box(double v) {
-			VAL vb;
+		inline INTERNALVALUE box(double v) {
+			INTERNALVALUE vb;
 			vb.dval = v;
-			if (vb.uval < 0xffffffff00000000LL) {
-				// if the pattern ok then return it
-				return vb;
-			} else {
-				// we had a NaN pattern that collided with our nunmask, return another nan
-				vb.uval &= 0xfffff8ff00000000LL;
-				return vb;
-			}
+			return vb;
+			//if (vb.uval < 0xffffffff00000000LL) {
+			//	// if the pattern ok then return it
+			//	return vb;
+			//} else {
+			//	// we had a NaN pattern that collided with our nunmask, return another nan
+			//	vb.uval &= 0xfffff8ff00000000LL;
+			//	return vb;
+			//}
 		}
-		VAL box(int v) {
+		INTERNALVALUE box(int v) {
 			return box((double)v);
 		}
 
@@ -755,14 +699,59 @@ namespace nanoes {
 			// 0x16
 			FGOTO,        // 1 value : 8bit op, 8bit slot, 16bit jump offset
 			// 0x17
-			GOTO          // 1 value : 8bit op, 8bit ????, 16bit jump offset
+			GOTO,         // 1 value : 8bit op, 8bit ????, 16bit jump offset
+			LOADSPROP,    // "3" values: 8bit op, 8bit slot, 16bit ??  : 32bit prop id : per-load-ptr
+			STORESPROP,   // "3" values: 8bit op, 8bit slot, 16bit ??  : 32bit prop id : per-store-ptr
 		};
 
+		class funtpl;
 		struct fungenctx {
+			runtime *rt;
 			std::vector<int32_t> code;
 			std::vector<nesvalue> literals;
 			std::vector<int> globals;
+			std::vector<std::shared_ptr<funtpl>> functions;
 			size_t sp = 0;
+
+
+			fungenctx(runtime *irt) : rt(irt) {}
+
+			void reset() {
+				sp = 0;
+				literals.clear();
+				globals.clear();
+				code.clear();
+				functions.clear();
+			}
+
+			void addfn(std::shared_ptr<funtpl> && fn) {
+				functions.push_back(std::move(fn));
+			}
+			int addlit(const std::string& v) {
+				int lid = literals.size();
+				literals.emplace_back(rt->uroot);
+				literals[lid].value = rt->box<std::string>(std::string(v));
+				return lid;
+			}
+			void add(OPC a, int32_t b = 0, int32_t c = 0, bool reladdr = false, double *dvp = nullptr) {
+				if (reladdr) {
+					//printf("Goto label %d from %d\n",c,gctx->code.size());
+					c -= code.size() + 1;
+				} else {
+					//printf("Op %d at %d\n", a, gctx->code.size());
+				}
+				int32_t v = (((int)a) | (b << 8) | (c << 16));
+				code.push_back(v);
+				if (dvp) {
+					INTERNALVALUE v = rt->box(*dvp);
+					code.push_back(int32_t(v.uval));
+					code.push_back(int32_t(v.uval >> 32));
+				}
+			}
+			int label() {
+				//printf("Label at %d\n", gctx->code.size());
+				return code.size();
+			}
 		};
 
 		class funtpl {
@@ -773,11 +762,12 @@ namespace nanoes {
 			int argcount;
 			std::vector<int32_t> code;
 			std::vector<nesvalue> literals;
-			std::vector<VAL*> globals;
+			std::vector<INTERNALVALUE*> globals;
+			std::vector<std::shared_ptr<funtpl>> functions;
 			std::string src;
 		public:
 			funtpl(runtime *in_rt, std::pair<int, std::string> in_id, int in_argcount, std::shared_ptr<scopeinfo>& in_si, fungenctx & in_gctx,std::string&& insrc)
-				: rt(in_rt), id(in_id), argcount(in_argcount), info(in_si),code(std::move(in_gctx.code)),literals(in_gctx.literals),src(insrc)
+				: rt(in_rt), id(in_id), argcount(in_argcount), info(in_si),code(std::move(in_gctx.code)),literals(in_gctx.literals),functions(std::move(in_gctx.functions)),src(insrc)
 			{
 				for (auto id : in_gctx.globals) {
 					globals.push_back(&rt->global[id]);
@@ -801,28 +791,21 @@ namespace nanoes {
 
 			virtual std::string to_string() { return "<FUNCTION...>"; }
 			virtual double to_num() { return 0; }
-			virtual bool truthy() {
-				return true;
-			}
-			static inline VAL invoke_impl(runtime *rt, funinst *fi, int argc, VAL *args);
-			virtual VAL invoke(runtime &rt, int argc, VAL *args) {
+			virtual bool truthy() {return true;}
+			static inline INTERNALVALUE invoke_impl(runtime *rt, funinst *fi, int argc, INTERNALVALUE *args);
+			virtual INTERNALVALUE invoke(runtime &rt, int argc, INTERNALVALUE *args) {
 				return invoke_impl(&rt, this, argc, args);
 			}
 
 		};
 
+		template<class RT,class GCTX,class FTPL>
 		struct parsectx {
-			runtime * rt;
+			RT * rt;
 			const char *state;
 			std::string tok;
 
-			parsectx(runtime *inrt):rt(inrt) {
-//				assert(!rt->cureval);
-//				rt->cureval = this;
-			}
-//			~parsectx() {
-//				rt->cureval = nullptr;
-//			}
+			parsectx(RT *inrt):rt(inrt) {}
 
 			std::vector<std::pair<scopeinfo*, int>> accesses;
 			std::vector<std::pair<const char*, std::shared_ptr<scopeinfo>>> scopes;
@@ -831,32 +814,10 @@ namespace nanoes {
 			bool prep = true;
 
 			std::map<void*, int> cgmem;
-			fungenctx * gctx;
+			GCTX * gctx;
 
-			int addlit(const std::string& v) {
-				int lid = gctx->literals.size();
-				gctx->literals.emplace_back(rt->uroot);
-				gctx->literals[lid].value = rt->box<std::string>(std::string(v));
-				return lid;
-			}
-			void add(OPC a,int32_t b=0,int32_t c=0,bool reladdr=false,double *dvp=nullptr) {
-				if (reladdr) {
-					//printf("Goto label %d from %d\n",c,gctx->code.size());
-					c -= gctx->code.size() + 1;
-				} else {
-					//printf("Op %d at %d\n", a, gctx->code.size());
-				}
-				int32_t v=(((int)a) | (b << 8) | (c << 16));
-				gctx->code.push_back(v);
-				if (dvp) {
-					VAL v = rt->box(*dvp);
-					gctx->code.push_back(int32_t(v.uval));
-					gctx->code.push_back(int32_t(v.uval>>32));
-				}
-			}
-			int label() {
-				//printf("Label at %d\n", gctx->code.size());
-				return gctx->code.size();
+			void add(OPC a, int32_t b = 0, int32_t c = 0, bool reladdr = false, double *dvp = nullptr) {
+				gctx->add(a, b, c, reladdr, dvp);
 			}
 
 			struct spres {
@@ -912,11 +873,413 @@ namespace nanoes {
 				}
 				return std::make_pair(-1, -1);
 			}
+
+			// this function indicates if the character is a valid symbol character
+			int sym(int x, bool first = true) { return x == '_' || (first ? isalpha(x) : isalnum(x)); }
+
+			// eat one token from the stream into the context
+			int lexeat(parsectx & ctx, double *ddest = nullptr) {
+				const char *& state = ctx.state;
+				// skip over spaces (TODO: update line numbers?)
+				while (std::isspace(*state)) state++;
+				// search our sorted token+ID list by narrowing
+				int rs = 0, re = rt->toks.size() - 1;
+				for (size_t sz = 0;rs <= re;) {
+					// pre-token is smaller, go to next
+					if (rt->toks[rs].second.size() != sz && (rt->toks[rs].second.size()<sz || rt->toks[rs].second.c_str()[sz] < state[sz])) {
+						rs++;
+						continue;
+					}
+					// post-token is larger, go to next
+					if (rt->toks[re].second.size() != sz && (rt->toks[re].second.size() < sz || rt->toks[re].second.c_str()[sz] > state[sz])) {
+						re--;
+						continue;
+					}
+					// pre- and post- token are equal and we've found it. (also make sure we don't have an ID token and it continues!)
+					if (rs == re && sz == rt->toks[rs].second.size() && !(sym(state[0]) && sym(state[sz], false))) {
+						ctx.tok.assign(state, sz);
+						state += sz;
+						return rt->toks[rs].first;
+					}
+					// ok, we haven't found a token or needed to narrow our range to so add another character
+					sz++;
+				}
+				// ok not an known operator or identifier, so either we have a new identifier or some kind of literal like a string or number
+				ctx.tok.clear();
+				if (*state == '\"') {
+					// parse a strings
+					state++;
+					char c;
+					while ((c = *state) != '\"') {
+						if (!c)
+							return -1;
+						if (c == '\\') {
+							state++;
+							if (*state == 'n') c = '\n';
+							else if (*state == 'r') c = '\r';
+							else if (*state == 'b') c = '\b';
+							else if (*state == 't') c = '\t';
+							// TODO: more charcter escape codes. ?
+							else c = *state;
+						}
+						ctx.tok.push_back(c);
+						state++;
+					}
+					state++;
+					return rt->STR;
+				} else if (isdigit(*state) || (*state == '-'&&isdigit(state[1]))) {
+					const char * start = state;
+					double num = 0;
+					double sign = *state == '-' ? -1 : 1;
+					if (sign < 0)
+						state++;
+					while (isdigit(*state)) {
+						num = (num * 10) + (*state - '0');
+						state++;
+					}
+					ctx.tok.assign(start, state - start);
+					if (ddest) {
+						*ddest = num*sign;
+					}
+					return rt->DNUM;
+				} else if (sym(*state)) {
+					while (sym(*state, false))
+						ctx.tok.push_back(*state++);
+					int rv = rt->atok(ctx.tok.c_str());
+					return rv;
+				} else if (*state == 0) {
+					ctx.tok = "<END OF FILE>";
+					return -1;
+				} else {
+					throw std::runtime_error(std::string("Error, unknown token at ") + state);
+				}
+			}
+
+			int lexpeek(parsectx & ctx, int eat = -1) {
+				const char* preState = ctx.state;
+				int rv = lexeat(ctx);
+				if (rv == eat && rv != -1)
+					return rv;
+				ctx.state = preState;
+				return rv;
+			}
+
+
+			std::shared_ptr<FTPL> parse_fun(parsectx & ctx, bool statement) {
+				const char *srcstart = ctx.state;
+				// TODO: add a skip-comment function
+				while (*srcstart && isspace(*srcstart)) srcstart++;
+
+				lexeat(ctx); // eat function token
+				auto argscope = ctx.enter_scope(); // this enters the arg-scope.
+
+				int argcount = 1;
+				if (prep)
+					argscope->names.emplace_back(rt->T_THIS, "this"); // dummy first arg to catch the "this"-arg
+
+				std::string & tok = ctx.tok;
+				auto id = std::make_pair(-1, std::string(""));
+				// parse name part
+				int name = lexpeek(ctx);
+				if (name >= rt->USER) {
+					lexeat(ctx);
+					id = std::make_pair(name, ctx.tok);
+				} else if (statement)
+					throw std::runtime_error("expected function name but found " + tok);
+
+				// next ensure we have parens for the argument list
+				if (rt->LPAR != lexeat(ctx))
+					throw std::runtime_error("expected ( after function name but found " + tok);
+				// and parse the namelist until the end.
+				if (rt->RPAR != lexpeek(ctx, rt->RPAR)) {
+					while (true) {
+						int arg = lexeat(ctx);
+						if (arg<rt->USER)
+							throw std::runtime_error("expected argument but found " + tok);
+						if (prep)
+							argscope->names.emplace_back(arg, tok);
+						argcount++;
+						int nxt = lexeat(ctx);
+						if (rt->COMMA == nxt)
+							continue;
+						else if (rt->RPAR == nxt)
+							break;
+						else
+							throw std::runtime_error("expected , or ) after argument but found " + tok);
+					}
+				}
+
+				// store some previous state.
+				GCTX *ogctx = ctx.gctx;
+				// now setup things for our context.
+				//printf(" ---- Begin fun....\n");
+				GCTX gctx(rt);
+				ctx.gctx = &gctx;
+				argscope->maxstack = gctx.sp = 0;
+
+				// check for a brace (the brace-pair will be parsed by the stmt parsing function)
+				if (rt->LBRA != lexpeek(ctx))
+					throw std::runtime_error("expected { after function arguments but found " + tok);
+				// now parse the body
+				stmt(ctx, -1);
+
+				// always unconditinal return at end
+				ctx.add(OPC::URETURN);
+
+				// restore previous state
+				ctx.gctx = ogctx;
+
+				argscope->maxnames = argscope->names.size();
+
+				ctx.leave_scope();
+				//printf(" ---- End fun....\n");
+				//auto outs = std::string(srcstart, ctx.state);
+				//auto ptr = new FTPL(rt, id, argcount, argscope, gctx, std::move(outs));
+				//return ctx.prep ? nullptr : ptr;
+				return ctx.prep ? nullptr : std::make_shared<FTPL>(rt, id, argcount, argscope, gctx, std::string(srcstart, ctx.state));
+			}
+			std::unique_ptr<spres> expr(int & tt, parsectx & ctx, int prec) {
+				std::string & tok = ctx.tok;
+				double dnum;
+				tt = lexeat(ctx, &dnum);
+				if (tt == -1)
+					return nullptr;
+				auto stack = std::make_unique<spres>(ctx, 1);
+
+				//OP cont = nullptr; OP val = nullptr; &cont, &val, 
+				auto deref = [&]()->void {
+					if (stack->sz != 1) {
+						// TODO: do something here?!
+						abort();
+					}
+				};
+				if (tt >= rt->USER) {
+					auto info = ctx.access(tt);
+					// These instructions will be different between passes.. they cannot be differently sized!
+					if (info.first == -1) {
+						size_t idx = std::distance(ctx.gctx->globals.begin(), std::find(ctx.gctx->globals.begin(), ctx.gctx->globals.end(), tt));
+						if (idx == ctx.gctx->globals.size())
+							ctx.gctx->globals.push_back(tt);
+						//printf("GlobLoad: %d %d\n",idx,tt);
+						ctx.add(OPC::LOADGLOBAL, stack->off, idx);
+					} else {
+						ctx.add(OPC::LOADSSYM, stack->off, (info.second) | (info.first << 10));
+					}
+				} else if (rt->STR == tt) {
+					ctx.add(OPC::LOADLIT, stack->off, gctx->addlit(tok)); // TODO: do value index..
+																		//ctx.add(box<double>(dnum));
+				} else if (tt == rt->DNUM) {
+					ctx.add(OPC::LOADDOUBLE, stack->off, 0, false, &dnum);
+				} else if (tt == rt->LPAR) {
+					stack.reset();
+					stack = expr(tt, ctx, 0);
+					tt = lexeat(ctx);
+					if (tt != rt->RPAR)
+						throw std::runtime_error("Unexpected token in parenthised expression, wanted ) to end it but found " + ctx.tok);
+				} else {
+					throw std::runtime_error("unknown primtok " + ctx.tok);
+				}
+
+			operatorloop: while (-1 != (tt = lexpeek(ctx))) {
+				// don't handle operators with too low precendce when doing a higher level.
+				if (tt < prec)
+					break;
+				const std::tuple<int, int, OPC> binops[] = {
+					{ rt->ADD,rt->MUL,OPC::ADD },
+					{ rt->T_SUB,rt->MUL,OPC::SUB },
+					{ rt->MUL,rt->T_MOD + 1,OPC::MUL },
+					{ rt->T_DIV,rt->T_MOD + 1,OPC::DIV },
+					{ rt->T_MOD,rt->T_MOD + 1,OPC::MOD },
+					{ rt->EQ,rt->LT,OPC::EQ },
+					{ rt->NEQ,rt->LT,OPC::NEQ },
+					{ rt->LT,rt->GT + 1,OPC::LT },
+					{ rt->LEQ,rt->GT + 1,OPC::LEQ },
+					{ rt->GEQ,rt->GT + 1,OPC::GEQ },
+					{ rt->GT,rt->GT + 1,OPC::GT }
+				};
+				for (int boidx = (sizeof(binops) / sizeof(binops[0])) - 1;boidx != -1;boidx--)
+					if (std::get<0>(binops[boidx]) == tt) {
+						lexeat(ctx); // eat the operator
+						deref(); // deref any references since we only want a value
+						std::unique_ptr<parsectx::spres> sub = expr(tt, ctx, std::get<1>(binops[boidx]));
+						if (sub) {
+							assert(stack->off + 1 == sub->off);
+							ctx.add(std::get<2>(binops[boidx]), stack->off);
+						}
+						goto operatorloop;
+					}
+				// not a simple binary operator...
+				if (rt->LPAR == tt) {
+					// eat ( first
+					lexeat(ctx);
+					std::unique_ptr<parsectx::spres> thstmp;
+					std::vector<std::unique_ptr<parsectx::spres>> targs;
+					if (stack->sz == 1) {
+						// no context given, only a fun-value
+						// reserve one slot for the "this" value to be loaded as null
+						thstmp = std::make_unique<parsectx::spres>(ctx, 1);
+						ctx.add(OPC::LOADNULL, thstmp->off);
+					} else {
+						abort();
+					}
+					if (rt->RPAR == (tt = lexpeek(ctx, rt->RPAR))) {
+					} else {
+						while (true) {
+							auto sub = expr(tt, ctx, 0);
+							targs.push_back(std::move(sub));
+							tt = lexeat(ctx);
+							if (tt == -1)
+								return nullptr;
+							else if (rt->COMMA == tt)
+								continue;
+							else if (rt->RPAR == tt)
+								break;
+							else
+								throw std::runtime_error("Unexpected token in funcall, wanted ) or , but found " + ctx.tok);
+						}
+					}
+					// stack reserved for fun-call
+					ctx.add(OPC::INVOKE, stack->off, targs.size() + 1);
+				} else {
+					break;
+				}
+			}
+						  deref();
+						  return std::move(stack);
+			}
+			int stmt(parsectx & ctx, int fnLvl) {
+				std::string & tok = ctx.tok;
+
+				int tt = lexpeek(ctx);
+				if (tt == -1)
+					return -1;
+				if (rt->LBRA == tt) {
+					lexeat(ctx);
+					while (true) {
+						if (rt->RBRA == lexpeek(ctx, rt->RBRA))
+							break;
+						if (-1 == stmt(ctx, fnLvl + 1))
+							throw std::runtime_error("Premature EOF");
+					}
+					return 1;
+				} else if (rt->T_FUNCTION == tt && fnLvl == 0) {
+					auto fn = parse_fun(ctx, true);
+					gctx->addfn(std::move(fn));
+					//if (ctx.curscope) {
+					//	abort();
+					//} else if (!ctx.prep) {
+					//	// we're at the toplevel eval, just box the fun-value directly!
+					//	VAL v = box(std::move(funinst(nullptr, fn)));
+					//	// we assign separately since we don't want bogus ptr slots in the map
+					//	global[fn->id.first] = v;
+					//}
+					// ?? change to prefixed mkfun/setglob?
+					// other options? add a fn-list to the parent-fun?
+					// ^- very practical, doesn't disturb code-gen.
+					return 1;
+				} else if (rt->T_RETURN == tt) {
+					lexeat(ctx);
+					std::unique_ptr<parsectx::spres> rexp;
+					if (rt->SEMICOLON == lexpeek(ctx, rt->SEMICOLON)) {
+						// no return expr, just generate a null value.
+						rexp = std::make_unique<parsectx::spres>(ctx, 1);
+						ctx.add(OPC::LOADNULL);
+					} else {
+						rexp = expr(tt, ctx, 0);
+						if (rt->SEMICOLON != lexeat(ctx))
+							throw std::runtime_error("expected ; but found " + tok);
+					}
+					ctx.add(OPC::RETURN, rexp->off);
+					return 1;
+				} else if (rt->T_IF == tt) {
+					// we need 2 gotos... IF fail target (else or end), tcode-end-target (post else or directly after?)
+					lexeat(ctx);
+					void* if_fail_key = (void*)ctx.state; // use left paren token ptr as if_fail_key
+					if (rt->LPAR != lexpeek(ctx))
+						throw std::runtime_error("expected ( after if but found " + tok);
+					auto condslot = expr(tt, ctx, 0);
+					// right parenthesis will have been parsed as part of the previous expression!
+					ctx.add(OPC::FGOTO, condslot->off, ctx.cgmem[if_fail_key], true);
+					// data in slot consumed!
+					condslot.reset();
+					stmt(ctx, fnLvl + 1);
+					if (rt->T_ELSE == lexpeek(ctx)) {
+						void* fcode_end_key = (void*)ctx.state; // use left paren token ptr as tcode_end_key
+						lexeat(ctx);
+						ctx.add(OPC::GOTO, 0, ctx.cgmem[fcode_end_key], true);
+						ctx.cgmem[if_fail_key] = gctx->label();
+						int rbr = stmt(ctx, fnLvl + 1);
+						ctx.cgmem[fcode_end_key] = gctx->label();
+					} else {
+						ctx.cgmem[if_fail_key] = gctx->label();
+					}
+					return 1;
+				} else if (rt->T_WHILE == tt) {
+					void* while_stop_key = (void*)ctx.state; // use while token ptr as while_stop_key
+					lexeat(ctx);
+					if (rt->LPAR != lexpeek(ctx))
+						throw std::runtime_error("expected ( after while but found " + tok);
+					int retrypos = gctx->label();
+					auto cond = expr(tt, ctx, 0);
+					// right parenthesis will have been parsed as part of the expression!
+					ctx.add(OPC::FGOTO, cond->off, ctx.cgmem[while_stop_key], true);
+					cond.reset();
+					// do body
+					// TODO: support continue/break
+					stmt(ctx, fnLvl + 1);
+					// and goto start
+					ctx.add(OPC::GOTO, 0, retrypos, true);
+					// we should land here if the while cond fails
+					ctx.cgmem[while_stop_key] = gctx->label();
+					return 1;
+				}
+				auto op = expr(tt, ctx, 0);
+				if (rt->SEMICOLON != lexeat(ctx))
+					throw std::runtime_error("expected ; but found " + tok);
+				return tt;
+			}
+
+			std::shared_ptr<FTPL> parse_top(const std::string & script, const std::string & src) {
+				// eval runs the parser twice to build a scope chain during the first pass.
+				//printf("---- Start of pass 1----------\n");
+				state = script.c_str();
+				topscope = std::make_shared<scopeinfo>();
+				topscope->top = true;
+				gctx->sp = 0;
+				// run first pass of the parser.
+				while (-1 != stmt(*this, 0)) {}
+
+				//printf("---- End of pass 1----------\n");
+				assert(gctx->sp == 0);
+				assert(!curscope);
+				// reset some things before the second iteration of the parser.
+				prep = false;           // turn off the prep-flag, this will cause memory to be allocated generated.
+				gctx->reset();
+				state = script.c_str(); // reset the parser ptr
+				tok.clear();            // clear the parsing token
+				curscope = nullptr;     // and ensure that we are at the toplevel scope (should not be unless there is parser bugs)
+				// also before the second pass we pre-dirty all scopes that has non-local variable accesses.
+				for (auto& acc : accesses) {
+					access(acc.second, acc.first);
+				}
+				// now run second pass o the parser
+				while (-1 != stmt(*this, 0)) {}
+				add(OPC::URETURN);
+				return std::make_shared<FTPL>(
+					rt,
+					std::make_pair(-1, std::string()),
+					0,
+					topscope,
+					*gctx,
+					std::string(script));
+			}
+
+
 		};
 
 		
 		template<class RC, class EC>
-		inline void do_cmp(VAL *slots, int off, const RC& rcmp, const EC& ecmp) {
+		inline void do_cmp(INTERNALVALUE *slots, int off, const RC& rcmp, const EC& ecmp) {
 			valuebase *lp = to_ptr(slots[off+0]);
 			valuebase *rp = to_ptr(slots[off+1]);
 			std::string * ls = lp ? lp->get<std::string>() : nullptr, *rs = rp ? rp->get<std::string>() : nullptr;
@@ -937,308 +1300,19 @@ namespace nanoes {
 			}
 		}
 
-		std::shared_ptr<funtpl> parse_fun(parsectx & ctx, bool statement) {
-			const char *srcstart = ctx.state;
-			lexeat(ctx); // eat function token
-			auto argscope = ctx.enter_scope(); // this enters the arg-scope.
 
-			int argcount = 1;
-			argscope->names.emplace_back(T_THIS, "this"); // dummy first arg to catch the "this"-arg
-
-			std::string & tok = ctx.tok;
-			auto id = std::make_pair(-1, std::string(""));
-			// parse name part
-			int name = lexpeek(ctx);
-			if (name >= USER) {
-				lexeat(ctx);
-				id = std::make_pair(name, ctx.tok);
-			} else if (statement)
-				throw std::runtime_error("expected function name but found " + tok);
-
-			// next ensure we have parens for the argument list
-			if (LPAR != lexeat(ctx))
-				throw std::runtime_error("expected ( after function name but found " + tok);
-			// and parse the namelist until the end.
-			if (RPAR != lexpeek(ctx, RPAR)) {
-				while (true) {
-					int arg = lexeat(ctx);
-					if (arg<USER)
-						throw std::runtime_error("expected argument but found " + tok);
-					argscope->names.emplace_back(arg, tok);
-					argcount++;
-					int nxt = lexeat(ctx);
-					if (COMMA == nxt)
-						continue;
-					else if (RPAR == nxt)
-						break;
-					else
-						throw std::runtime_error("expected , or ) after argument but found " + tok);
-				}
-			}
-			
-			// store some previous state.
-			fungenctx *ogctx= ctx.gctx;
-			// now setup things for our context.
-			printf(" ---- Begin fun....\n");
-			fungenctx gctx;
-			ctx.gctx = &gctx;
-			argscope->maxstack = gctx.sp = 0;
-
-			// check for a brace (the brace-pair will be parsed by the stmt parsing function)
-			if (LBRA != lexpeek(ctx))
-				throw std::runtime_error("expected { after function arguments but found " + tok);
-			// now parse the body
-			stmt(ctx, -1);
-
-			// always unconditinal return at end
-			ctx.add(OPC::URETURN);
-
-			// restore previous state
-			ctx.gctx = ogctx;
-
-			argscope->maxnames = argscope->names.size();
-
-			ctx.leave_scope();
-			printf(" ---- End fun....\n");
-			return ctx.prep?nullptr:std::make_shared<funtpl>(this,id, argcount, argscope, gctx,std::string(srcstart,ctx.state));
-		}
-		std::unique_ptr<parsectx::spres> expr(int & tt, parsectx & ctx, int prec) {
-			std::string & tok = ctx.tok;
-			double dnum;
-			tt = lexeat(ctx, &dnum);
-			if (tt == -1)
-				return nullptr;
-			auto stack = std::make_unique<parsectx::spres>(ctx, 1);
-			
-			//OP cont = nullptr; OP val = nullptr; &cont, &val, 
-			auto deref = [&]()->void {
-				if (stack->sz != 1) {
-					// TODO: do something here?!
-					abort();
-				}
-			};
-			if (tt >= USER) {
-				auto info = ctx.access(tt);
-				// These instructions will be different between passes.. they cannot be differently sized!
-				if (info.first == -1) {
-					size_t idx=std::distance(ctx.gctx->globals.begin(),std::find(ctx.gctx->globals.begin(), ctx.gctx->globals.end(), tt));
-					if (idx == ctx.gctx->globals.size())
-						ctx.gctx->globals.push_back(tt);
-					ctx.add(OPC::LOADGLOBAL, stack->off,idx);
-				} else {
-					ctx.add(OPC::LOADSSYM,stack->off,(info.second)|(info.first<<10));
-				}
-			} else if (STR == tt) {
-				ctx.add(OPC::LOADLIT, stack->off,ctx.addlit(tok)); // TODO: do value index..
-				//ctx.add(box<double>(dnum));
-			} else if (tt == DNUM) {
-				ctx.add(OPC::LOADDOUBLE, stack->off,0,false,&dnum);
-			} else if (tt == LPAR) {
-				stack.reset();
-				stack=expr(tt, ctx, 0);
-				tt = lexeat(ctx);
-				if (tt != RPAR)
-					throw std::runtime_error("Unexpected token in parenthised expression, wanted ) to end it but found " + ctx.tok);
-			} else {
-				throw std::runtime_error("unknown primtok " + ctx.tok);
-			}
-
-			operatorloop: while (-1 != (tt = lexpeek(ctx))) {
-				// don't handle operators with too low precendce when doing a higher level.
-				if (tt < prec)
-					break;
-				const std::tuple<int, int, OPC> binops[] = {
-					{ ADD,MUL,OPC::ADD },
-					{ T_SUB,MUL,OPC::SUB },
-					{ MUL,T_MOD + 1,OPC::MUL },
-					{ T_DIV,T_MOD + 1,OPC::DIV },
-					{ T_MOD,T_MOD + 1,OPC::MOD },
-					{ EQ,LT,OPC::EQ },
-					{ NEQ,LT,OPC::NEQ },
-					{ LT,GT + 1,OPC::LT },
-					{ LEQ,GT + 1,OPC::LEQ },
-					{ GEQ,GT + 1,OPC::GEQ },
-					{ GT,GT + 1,OPC::GT }
-				};
-				for (int boidx = (sizeof(binops) / sizeof(binops[0])) - 1;boidx != -1;boidx--)
-					if (std::get<0>(binops[boidx])==tt) {
-						lexeat(ctx); // eat the operator
-						deref(); // deref any references since we only want a value
-						std::unique_ptr<parsectx::spres> sub = expr(tt, ctx, std::get<1>(binops[boidx]) );
-						if (sub) {
-							assert(stack->off+1 == sub->off);
-							ctx.add(std::get<2>(binops[boidx]), stack->off);
-						}
-						goto operatorloop;
-					}
-				// not a simple binary operator...
-				if (LPAR == tt) {
-					// eat ( first
-					lexeat(ctx);
-					std::unique_ptr<parsectx::spres> thstmp;
-					std::vector<std::unique_ptr<parsectx::spres>> targs;
-					if (stack->sz == 1) {
-						// no context given, only a fun-value
-						// reserve one slot for the "this" value to be loaded as null
-						thstmp = std::make_unique<parsectx::spres>(ctx, 1);
-						ctx.add(OPC::LOADNULL, thstmp->off);
-					} else {
-						abort();
-					}
-					if (RPAR == (tt = lexpeek(ctx, RPAR))) {
-					} else {
-						while (true) {
-							auto sub = expr(tt, ctx, 0);
-							targs.push_back(std::move(sub));
-							tt = lexeat(ctx);
-							if (tt == -1)
-								return nullptr;
-							else if (COMMA == tt)
-								continue;
-							else if (RPAR == tt)
-								break;
-							else
-								throw std::runtime_error("Unexpected token in funcall, wanted ) or , but found " + ctx.tok);
-						}
-					}
-					// stack reserved for fun-call
-					ctx.add(OPC::INVOKE, stack->off, targs.size()+1);
-				} else {
-					break;
-				}
-			}
-			deref();
-			return std::move(stack);
-		}
-		int stmt(parsectx & ctx, int fnLvl) {
-			std::string & tok = ctx.tok;
-
-			int tt = lexpeek(ctx);
-			if (tt == -1)
-				return -1;
-			if (LBRA == tt) {
-				lexeat(ctx);
-				while (true) {
-					if (RBRA == lexpeek(ctx, RBRA))
-						break;
-					if (-1 == stmt(ctx, fnLvl + 1))
-						throw std::runtime_error("Premature EOF");
-				}
-				return 1;
-			} else if (T_FUNCTION == tt && fnLvl == 0) {
-				auto fn = parse_fun(ctx, true);
-				if (ctx.curscope) {
-					abort();
-				} else if (!ctx.prep) {
-					// we're at the toplevel eval, just box the fun-value directly!
-					VAL v = box(std::move(funinst(nullptr, fn)));
-					// we assign separately since we don't want bogus ptr slots in the map
-					global[fn->id.first] = v;
-				}
-				return 1;
-			} else if (T_RETURN == tt) {
-				lexeat(ctx);
-				std::unique_ptr<parsectx::spres> rexp;
-				if (SEMICOLON == lexpeek(ctx, SEMICOLON)) {
-					// no return expr, just generate a null value.
-					rexp = std::make_unique<parsectx::spres>(ctx, 1);
-					ctx.add(OPC::LOADNULL);
-				} else {
-					rexp = expr(tt, ctx, 0);
-					if (SEMICOLON != lexeat(ctx))
-						throw std::runtime_error("expected ; but found " + tok);
-				}
-				ctx.add(OPC::RETURN,rexp->off);
-				return 1;
-			} else if (T_IF == tt) {
-				// we need 2 gotos... IF fail target (else or end), tcode-end-target (post else or directly after?)
-				lexeat(ctx);
-				void* if_fail_key = (void*)ctx.state; // use left paren token ptr as if_fail_key
-				if (LPAR != lexpeek(ctx))
-					throw std::runtime_error("expected ( after if but found " + tok);
-				auto condslot = expr(tt, ctx, 0);
-				// right parenthesis will have been parsed as part of the previous expression!
-				ctx.add(OPC::FGOTO, condslot->off, ctx.cgmem[if_fail_key], true);
-				// data in slot consumed!
-				condslot.reset();
-				stmt(ctx, fnLvl + 1);
-				if (T_ELSE == lexpeek(ctx)) {
-					void* fcode_end_key = (void*)ctx.state; // use left paren token ptr as tcode_end_key
-					lexeat(ctx);
-					ctx.add(OPC::GOTO, 0, ctx.cgmem[fcode_end_key], true);
-					ctx.cgmem[if_fail_key] = ctx.label();
-					int rbr = stmt(ctx, fnLvl + 1);
-					ctx.cgmem[fcode_end_key] = ctx.label();
-				} else {
-					ctx.cgmem[if_fail_key] = ctx.label();
-				}
-				return 1;
-			} else if (T_WHILE == tt) {
-				void* while_stop_key = (void*)ctx.state; // use while token ptr as while_stop_key
-				lexeat(ctx);
-				if (LPAR != lexpeek(ctx))
-					throw std::runtime_error("expected ( after while but found " + tok);
-				int retrypos = ctx.label();
-				auto cond = expr(tt, ctx, 0);
-				// right parenthesis will have been parsed as part of the expression!
-				ctx.add(OPC::FGOTO, cond->off, ctx.cgmem[while_stop_key], true);
-				cond.reset();
-				// do body
-				// TODO: support continue/break
-				stmt(ctx, fnLvl + 1);
-				// and goto start
-				ctx.add(OPC::GOTO, 0, retrypos, true);
-				// we should land here if the while cond fails
-				ctx.cgmem[while_stop_key] = ctx.label();
-				return 1;
-			}
-			auto op = expr(tt, ctx, 0);
-			if (SEMICOLON != lexeat(ctx))
-				throw std::runtime_error("expected ; but found " + tok);
-			return tt;
-		}
 	public:
 		template<class T>
 		void set(const std::string& id, T&& o) {
 			int iid = atok(id.c_str());
-			VAL v = box(std::move(o));
+			INTERNALVALUE v = box(std::move(o));
 			global[iid] = v;
 		}
-		void eval(const std::string & script, const char *src = "<EVAL>") {
-			std::shared_ptr<funtpl> efn;
-			{
-				// eval runs the parser twice to build a scope chain during the first pass.
-				parsectx ctx(this);
-				printf("---- Start of pass 1----------\n");
-				ctx.rt = this;
-				ctx.state = script.c_str();
-				ctx.topscope = std::make_shared<scopeinfo>();
-				fungenctx gctx;
-				ctx.gctx = &gctx;
-				gctx.sp = 0;
-				// run first pass of the parser.
-				while (-1 != stmt(ctx, 0)) {}
-
-				printf("---- End of pass 1----------\n");
-				assert(gctx.sp == 0);
-				assert(!ctx.curscope);
-				// reset some things before the second iteration of the parser.
-				ctx.prep = false;           // turn off the prep-flag, this will cause memory to be allocated generated.
-				gctx.code.clear();                // reset the top code vector.
-				gctx.literals.clear();       // remove the literals to re-gen them
-				gctx.globals.clear();
-				ctx.state = script.c_str(); // reset the parser ptr
-				ctx.tok.clear();            // clear the parsing token
-				ctx.curscope = nullptr;     // and ensure that we are at the toplevel scope (should not be unless there is parser bugs)
-				// also before the second pass we pre-dirty all scopes that has non-local variable accesses.
-				for (auto& acc : ctx.accesses) {
-					ctx.access(acc.second, acc.first);
-				}
-				// now run second pass o the parser
-				while (-1 != stmt(ctx, 0)) {}
-				ctx.add(OPC::URETURN);
-				efn = std::make_shared<funtpl>(this, std::make_pair(-1, std::string()), 0, ctx.topscope, gctx,std::string(script));
-			}
+		void eval(const std::string & script, const std::string & src = "<EVAL>") {
+			parsectx<runtime,fungenctx, funtpl> ctx(this);
+			fungenctx gctx(this);
+			ctx.gctx = &gctx;
+			std::shared_ptr<funtpl> efn = ctx.parse_top(script,src);
 			// with the code generated, make a dummy fun and invoke it!
 			{
 				// TODO: efin needs to be able to mark the literals...
@@ -1263,28 +1337,39 @@ namespace nanoes {
 		}
 	};
 
-	inline VAL runtime::funinst::invoke_impl(runtime *rt, funinst *fi, int argc, VAL *args) {
+	inline INTERNALVALUE runtime::funinst::invoke_impl(runtime *rt, funinst *fi, int argc, INTERNALVALUE *args) {
 		auto ftpl=fi->qp;
 		// create local scope if the functions scope is local.
 		bool is_local = ftpl->info->local;
-		VAL* localdata = is_local ? (VAL*)alloca(sizeof(VAL)*ftpl->info->maxnames) : nullptr;
+		INTERNALVALUE* localdata = is_local ? (INTERNALVALUE*)alloca(sizeof(INTERNALVALUE)*ftpl->info->maxnames) : nullptr;
 		scope local(is_local?localdata:nullptr, ftpl->info.get());
 		scope * cur = &local;
 		if (!is_local) {
 			abort(); // TODO, allocate a heap based scope instead! (hmm.... it could be feasible to do it just via a simple moveto since the logic is there...)
 		}
 		// TODO: varargs
-		int copyargs = std::min(argc, ftpl->argcount);
-		for (int i = 0;i < copyargs;i++) {
+		int copy_arg_count = std::min(argc, ftpl->argcount);
+		for (int i = 0;i < copy_arg_count;i++) {
 			cur->nslots[i] = args[i];
 		}
-		//	return rt.runblock(qp,fnscope, this->code->code.data());
+		// install functions
+		for (size_t i = 0;i < ftpl->functions.size();i++) {
+			auto & fn = ftpl->functions[i];
+			// TODO: scope
+			INTERNALVALUE v = rt->box(funinst(nullptr, fn));
+			if (ftpl->info->top) {
+				// we assign separately since we don't want bogus ptr slots in the map
+				rt->global[fn->id.first] = v;
+			} else {
+				abort();
+			}
+		}
 		{
 			auto ops = ftpl->code.data();
 			int mstack = ftpl->info->maxstack;
-			VAL* stack = (VAL*)alloca(sizeof(VAL)*mstack);
+			INTERNALVALUE* stack = (INTERNALVALUE*)alloca(sizeof(INTERNALVALUE)*mstack);
 			frame cframe(rt, &cur,mstack, stack);
-			VAL rv;
+			INTERNALVALUE rv;
 			rv.uval = 0;
 			while (true) {
 				int eop = *ops++;
@@ -1325,7 +1410,7 @@ namespace nanoes {
 					continue;
 				}
 				case OPC::LOADGLOBAL: {
-					VAL* p = ftpl->globals[ARG1];
+					INTERNALVALUE* p = ftpl->globals[ARG1];
 					stack[ARG0] = *p;
 					continue;
 				}
@@ -1397,6 +1482,23 @@ namespace nanoes {
 					}
 					continue;
 				}
+				case OPC::LOADSPROP :
+					// obj from stack[ARG0] (need co-erce to obj before this call or number-proto-redir?)
+					// if (!LOCALPTR)
+					//   slowpath(&localptr);
+					// else
+					//   if (localptr[0]==hiddenclz) {
+					//      stack[ARG0]=obj_as_cp+localptr[1];
+					//   } else {
+					//      for (i=2;;i+=2) {
+					//         if (localptr[i]==hiddenclz) { swaplocalptr_i_and_0(); stack[ARG0]=obj_as_cp+localptr[i]; break;  }
+					//         if (i<MAXLOCALPTR) continue;
+					//         SLOWPATH(); break;
+					//      }
+					//      
+					//   }
+					//   INTRP( op+=LOCALPTRSIZE )
+					throw std::runtime_error("Bad state " + std::to_string(int(op)));
 				default:
 					throw std::runtime_error("Bad state " + std::to_string(int(op)));
 				}

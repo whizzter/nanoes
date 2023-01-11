@@ -19,6 +19,9 @@ Done:
 + if statements
 + while loops
 
+In-progress:
+* precompiler, transforms scripts to a precompiled C++ header with inlined C++ code for 3x greater performance vs bytecode.
+
 TODO:
 + objects
 + arrays

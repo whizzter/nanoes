@@ -1,7 +1,7 @@
 #include <iostream>
 
 #include "nanoes.hpp"
-
+#include "prec.hpp"
 
 #include <limits>
 
@@ -9,21 +9,36 @@
 #include <iostream>
 #include <time.h>
 
-
-int main() {
+int main(int argc, char** argv) {
+	auto hasArg = [&](const std::string arg) {
+		for (int i = 1; i < argc; i++) {
+			if (arg == argv[i])
+				return true;
+		}
+		return false;
+	};
 	nanoes::runtime rt(10000);
-	rt.set("print", std::function<int(void*, std::string)>([](auto ths,auto f) {
+	rt.set("print", std::function<int(void*, std::string)>([](auto ths, auto f) {
 		std::cout << "Print[" << f << "]\n";
 		return 0;
-	}));
+		}));
 	rt.set("xstr", std::string("global X value"));
 	rt.set("true", true);
 	rt.set("false", false);
-#if 1
+
+	if (hasArg("-p")) {
+		double start = clock();
+		nanoes::precompiled::eval(rt);
+		double end = clock();
+		printf("Time taken: %f\n", (end - start) / CLOCKS_PER_SEC);
+	}
+#if 0
 	// test ext-call and string-const
 	rt.eval(R"-(
-		print("Hello world");
+		print("Interp Hello world");
 	)-");
+#endif
+#if 0
 	// test string+bool add
 	rt.eval(R"-(
 		print("Hello world:"+true);
@@ -68,31 +83,30 @@ int main() {
 			print("want arg not global ? -> "+xstr);
 		}
 	)-");
-#endif
-
-#if 1
 	rt.eval(R"-(
 		print("should return 123:"+ret123());
 		function ret123(x) {
 			return 123;
 		}
 	)-");
-
-	// finally time the fibonacchi
-	double start = clock();
-	rt.eval(R"-(
-		print("fib 35:"+fib(35));
-		function fib(x) {
-			if (x<2) {
-				return x;
-			} else {
-				return fib(x-2)+fib(x-1);
-			}
-		}
-	)-");
-	double end = clock();
-	printf("Time taken: %f\n",(end-start)/CLOCKS_PER_SEC);
 #endif
+
+	if (hasArg("-f")) {
+		double start = clock();
+		// finally time the fibonacchi
+		rt.eval(R"-(
+			print("fib 35:"+fib(35));
+			function fib(x) {
+				if (x<2) {
+					return x;
+				} else {
+					return fib(x-2)+fib(x-1);
+				}
+			}
+		)-");
+		double end = clock();
+		printf("Time taken: %f\n", (end - start) / CLOCKS_PER_SEC);
+	}
 
 #if 0
 	// Early GC test(pre-interning string constants will produce garbage)
